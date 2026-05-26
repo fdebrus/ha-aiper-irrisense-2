@@ -245,6 +245,7 @@ class IrrisenseCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     identifiers={(DOMAIN, sn)}
                 )
                 if dev_entry is not None and dev_entry.disabled_by is not None:
+                    _LOGGER.debug("Skipping disabled device %s in refresh", sn)
                     continue
                 await self._refresh_device(sn, dev)
 

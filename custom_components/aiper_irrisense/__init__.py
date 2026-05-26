@@ -108,7 +108,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not sn:
             return False
         dev_entry = device_registry.async_get_device(identifiers={(DOMAIN, sn)})
-        return dev_entry is None or dev_entry.disabled_by is None
+        if dev_entry is not None and dev_entry.disabled_by is not None:
+            _LOGGER.info(
+                "Skipping disabled device %s (disabled_by=%s)",
+                sn, dev_entry.disabled_by,
+            )
+            return False
+        return True
 
     devices = [d for d in devices if _is_enabled(d.get("sn", ""))]
 
