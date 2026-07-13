@@ -28,6 +28,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
+from .exceptions import CannotConnect, InvalidAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,16 +51,14 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         region=data[CONF_REGION],
     )
     try:
-        ok = await hass.async_add_executor_job(api.login)
-        if not ok:
-            raise InvalidAuth
-
+        await hass.async_add_executor_job(api.login)
         devices = await hass.async_add_executor_job(api.get_devices)
     except InvalidAuth:
         raise
     except Exception as err:
+        # Not an auth rejection — network blip, timeout, unexpected response.
         _LOGGER.error("Irrisense login validation failed: %s", err)
-        raise InvalidAuth from err
+        raise CannotConnect from err
     finally:
         await hass.async_add_executor_job(api.disconnect)
 
@@ -89,6 +88,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 info = await validate_input(self.hass, user_input)
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
             except NoIrrisenseDevices:
                 errors["base"] = "no_devices"
             except Exception:  # noqa: BLE001
@@ -119,6 +120,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Unexpected exception during reauth")
                 errors["base"] = "unknown"
@@ -185,10 +188,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
-
-
-class InvalidAuth(HomeAssistantError):
-    """Invalid credentials."""
 
 
 class NoIrrisenseDevices(HomeAssistantError):

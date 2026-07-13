@@ -22,6 +22,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import IrrisenseCoordinator
+from .exceptions import InvalidAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,17 +109,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(
             f"Aiper cloud timeout during setup (check network): {ex}"
         ) from ex
-    except Exception as ex:  # noqa: BLE001 - api.login distinguishes auth vs other via message text
-        # api.login raises Exception("Login failed: ...") on cloud-rejected
-        # credentials and Exception("No token in login response: ...") on
-        # protocol errors. Both are permanent config problems that should
-        # trigger HA's reauth flow rather than infinite ConfigEntryNotReady
-        # backoff. Discriminate by message prefix; anything else falls
-        # back to transient cloud-error retry.
-        if "Login failed" in str(ex) or "No token" in str(ex):
-            raise ConfigEntryAuthFailed(
-                f"Aiper authentication failed: {ex}"
-            ) from ex
+    except InvalidAuth as ex:
+        # Cloud-rejected credentials (or a login response with no token) are
+        # permanent config problems — trigger HA's reauth flow rather than
+        # infinite ConfigEntryNotReady backoff.
+        raise ConfigEntryAuthFailed(
+            f"Aiper authentication failed: {ex}"
+        ) from ex
+    except Exception as ex:  # noqa: BLE001 - anything else is a transient cloud error
         raise ConfigEntryNotReady(
             f"Aiper cloud error during setup: {ex}"
         ) from ex

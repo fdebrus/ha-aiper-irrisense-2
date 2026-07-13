@@ -53,6 +53,7 @@ from .const import (
     WATER_YIELD_LOW,
 )
 from .crypto import AiperEncryption
+from .exceptions import InvalidAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -376,7 +377,7 @@ class IrrisenseApi:
         payload = self._call_encrypted("POST", "/login", login_data, token="")
         if not self._is_success(payload):
             msg = payload.get("msg") or payload.get("message") or "Unknown error"
-            raise Exception(f"Login failed: {msg}")
+            raise InvalidAuth(f"Login failed: {msg}")
 
         result = payload.get("data", {}) or {}
         self._token = result.get("token")
@@ -388,7 +389,7 @@ class IrrisenseApi:
             self.base_url = str(domains[0]).rstrip("/")
 
         if not self._token:
-            raise Exception(f"No token in login response: {result}")
+            raise InvalidAuth(f"No token in login response: {result}")
 
         self._session.headers["token"] = self._token
         _LOGGER.info("Irrisense login OK (base_url=%s)", self.base_url)
