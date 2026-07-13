@@ -3,8 +3,8 @@
   "name": "Aiper Irrisense 2",
   "codeowners": ["@Merlz"],
   "config_flow": true,
-  "documentation": "https://github.com/Merlz/ha-aiper-irrisense-2",
-  "issue_tracker": "https://github.com/Merlz/ha-aiper-irrisense-2/issues",
+  "documentation": "https://github.com/fdebrus/ha-aiper-irrisense-2",
+  "issue_tracker": "https://github.com/fdebrus/ha-aiper-irrisense-2/issues",
   "iot_class": "cloud_polling",
   "version": "0.3.0",
   "requirements": [
