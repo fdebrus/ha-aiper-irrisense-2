@@ -136,6 +136,10 @@ options available via the integration's **Configure** button:
 
 - **MQTT debug logging** — logs every inbound / outbound MQTT frame at INFO
   level. Off by default. Turn on only for diagnostics; the volume is high.
+- **Advanced diagnostics** — exposes the raw `aiper_irrisense.debug_publish`
+  service, which publishes an arbitrary payload to an arbitrary MQTT topic on
+  the device's connection. Off by default; enable only when experimenting with
+  wire payloads.
 
 ## Known limitations
 

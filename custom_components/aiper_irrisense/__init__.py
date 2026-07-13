@@ -15,6 +15,7 @@ from homeassistant.helpers import config_validation as cv, device_registry as dr
 
 from .api import IrrisenseApi
 from .const import (
+    CONF_ADVANCED_DIAGNOSTICS,
     CONF_ENABLE_MQTT,
     CONF_MQTT_DEBUG,
     CONF_REGION,
@@ -188,6 +189,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     _register_services(hass)
+    # Register (or remove) the diagnostic debug_publish service depending on
+    # whether any loaded entry has advanced diagnostics enabled.
+    _reconcile_debug_publish_service(hass)
     return True
 
 
@@ -243,6 +247,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for svc in (SERVICE_START_ZONE, SERVICE_STOP_ZONE, SERVICE_QUERY_WORK_INFO, SERVICE_DEBUG_PUBLISH):
             if hass.services.has_service(DOMAIN, svc):
                 hass.services.async_remove(DOMAIN, svc)
+    else:
+        # Other entries remain. Re-evaluate the diagnostic service in case
+        # this reload turned the advanced-diagnostics option off (the option
+        # change triggers unload → setup; setup re-registers if still wanted).
+        _reconcile_debug_publish_service(hass)
     return unload_ok
 
 
@@ -251,20 +260,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 # ---------------------------------------------------------------------- #
 
 
+def _find_coordinator(hass: HomeAssistant, sn: str) -> IrrisenseCoordinator | None:
+    for slot in hass.data.get(DOMAIN, {}).values():
+        coord: IrrisenseCoordinator = slot["coordinator"]
+        if sn in (d.get("sn") for d in coord.devices):
+            return coord
+    return None
+
+
 def _register_services(hass: HomeAssistant) -> None:
     if hass.services.has_service(DOMAIN, SERVICE_START_ZONE):
         return
 
-    def _find_coordinator(sn: str) -> IrrisenseCoordinator | None:
-        for slot in hass.data.get(DOMAIN, {}).values():
-            coord: IrrisenseCoordinator = slot["coordinator"]
-            if sn in (d.get("sn") for d in coord.devices):
-                return coord
-        return None
-
     async def _svc_start_zone(call: ServiceCall) -> None:
         sn = call.data[ATTR_SN]
-        coord = _find_coordinator(sn)
+        coord = _find_coordinator(hass, sn)
         if not coord:
             _LOGGER.error("start_zone: unknown SN %s", sn)
             return
@@ -280,7 +290,7 @@ def _register_services(hass: HomeAssistant) -> None:
 
     async def _svc_stop_zone(call: ServiceCall) -> None:
         sn = call.data[ATTR_SN]
-        coord = _find_coordinator(sn)
+        coord = _find_coordinator(hass, sn)
         if not coord:
             _LOGGER.error("stop_zone: unknown SN %s", sn)
             return
@@ -288,18 +298,30 @@ def _register_services(hass: HomeAssistant) -> None:
 
     async def _svc_query_work(call: ServiceCall) -> None:
         sn = call.data[ATTR_SN]
-        coord = _find_coordinator(sn)
+        coord = _find_coordinator(hass, sn)
         if not coord:
             return
         await hass.async_add_executor_job(coord.api.query_work_info, sn)
 
+    hass.services.async_register(DOMAIN, SERVICE_START_ZONE, _svc_start_zone, schema=START_ZONE_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_STOP_ZONE, _svc_stop_zone, schema=STOP_ZONE_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_QUERY_WORK_INFO, _svc_query_work, schema=QUERY_WORK_SCHEMA)
+
+
+def _make_debug_publish_service(hass: HomeAssistant):
+    """Build the diagnostic ``debug_publish`` handler.
+
+    Publishes arbitrary bytes to an arbitrary MQTT topic on the device's
+    connection — a troubleshooting hatch used while reverse-engineering
+    setWorkMode acceptance. ``hass`` is captured by closure because
+    ``ServiceCall`` does not expose it on all supported HA versions. Guarded
+    by the advanced-diagnostics option — see
+    :func:`_reconcile_debug_publish_service`.
+    """
+
     async def _svc_debug_publish(call: ServiceCall) -> None:
-        """Diagnostic: publish arbitrary bytes to an arbitrary MQTT topic on
-        the device's MQTT connection. Used to experiment with payload shapes
-        while reverse-engineering setWorkMode acceptance.
-        """
         sn = call.data[ATTR_SN]
-        coord = _find_coordinator(sn)
+        coord = _find_coordinator(hass, sn)
         if not coord:
             _LOGGER.error("debug_publish: unknown SN %s", sn)
             return
@@ -310,7 +332,28 @@ def _register_services(hass: HomeAssistant) -> None:
             int(call.data.get(ATTR_QOS, 1)),
         )
 
-    hass.services.async_register(DOMAIN, SERVICE_START_ZONE, _svc_start_zone, schema=START_ZONE_SCHEMA)
-    hass.services.async_register(DOMAIN, SERVICE_STOP_ZONE, _svc_stop_zone, schema=STOP_ZONE_SCHEMA)
-    hass.services.async_register(DOMAIN, SERVICE_QUERY_WORK_INFO, _svc_query_work, schema=QUERY_WORK_SCHEMA)
-    hass.services.async_register(DOMAIN, SERVICE_DEBUG_PUBLISH, _svc_debug_publish, schema=DEBUG_PUBLISH_SCHEMA)
+    return _svc_debug_publish
+
+
+def _reconcile_debug_publish_service(hass: HomeAssistant) -> None:
+    """Register or remove the diagnostic ``debug_publish`` service.
+
+    The service is a raw-MQTT publish hatch, so it is opt-in: it exists only
+    while at least one loaded config entry has the advanced-diagnostics option
+    enabled. Called on every setup and on unload so toggling the option (which
+    reloads the entry) adds or removes the service accordingly.
+    """
+    want = any(
+        entry.options.get(CONF_ADVANCED_DIAGNOSTICS, False)
+        for entry in hass.config_entries.async_entries(DOMAIN)
+    )
+    has = hass.services.has_service(DOMAIN, SERVICE_DEBUG_PUBLISH)
+    if want and not has:
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DEBUG_PUBLISH,
+            _make_debug_publish_service(hass),
+            schema=DEBUG_PUBLISH_SCHEMA,
+        )
+    elif has and not want:
+        hass.services.async_remove(DOMAIN, SERVICE_DEBUG_PUBLISH)
