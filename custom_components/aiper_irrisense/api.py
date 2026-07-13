@@ -241,11 +241,22 @@ class IrrisenseApi:
         _LIVE_API_INSTANCES.add(self)
         _ensure_global_excepthook_installed()
 
-        # REST session
+        # REST session. The synchronous `requests` session backs the auth /
+        # AWS-credential chain, which must be callable from the (non-event-loop)
+        # MQTT bootstrap + reconnect threads. Device-data calls use aiohttp via
+        # `_async_call_encrypted` and the shared async session below.
         self._session = requests.Session()
         self._rest_lock = threading.Lock()
         self._rest_min_interval = 0.8
         self._rest_next_allowed = 0.0
+        # aiohttp session for async device-data calls. Attached by the
+        # coordinator (Home Assistant's shared session) via
+        # `attach_async_session`; falls back to a self-owned session for
+        # non-HA callers. Both the sync and async paths share the same
+        # `_rest_next_allowed` spacing window.
+        self._async_session: aiohttp.ClientSession | None = None
+        self._owns_async_session = False
+        self._async_rest_lock = asyncio.Lock()
         self._session.headers.update(
             {
                 "Content-Type": "application/json",
@@ -320,6 +331,46 @@ class IrrisenseApi:
                 delay = min(delay * 2.0, 8.0)
         raise last_exc if last_exc else Exception("Request failed")
 
+    def _build_encrypted_request(
+        self,
+        path: str,
+        body: dict | None,
+        *,
+        base_url: str | None,
+        token: str | None,
+    ) -> tuple[AiperEncryption, str, dict, str | None]:
+        """Build the wire-critical parts of an encrypted REST call.
+
+        SINGLE source of truth for what goes on the wire — headers (including
+        the RSA ``encryptKey`` and current ``token``), URL, and the AES-CBC
+        encrypted body — shared verbatim by both the synchronous
+        (:meth:`_call_encrypted`) and asynchronous
+        (:meth:`_async_call_encrypted`) senders so the two paths can never
+        drift. The reverse-engineered envelope lives entirely here + in
+        :mod:`.crypto`.
+        """
+        enc = AiperEncryption()
+        headers = dict(self._session.headers)
+        headers["encryptKey"] = enc.encrypt_key_header
+        headers["token"] = token or (self._token or "")
+
+        url_base = (base_url or self.base_url).rstrip("/")
+        url = f"{url_base}{path}"
+
+        data = enc.encrypt_request(body) if body is not None else None
+        return enc, url, headers, data
+
+    @staticmethod
+    def _decode_encrypted_response(enc: AiperEncryption, path: str, text: str) -> dict:
+        """Decrypt + JSON-parse a REST response. Shared by both senders."""
+        decrypted = enc.decrypt_response(text)
+        try:
+            return json.loads(decrypted)
+        except Exception as err:
+            raise Exception(
+                f"Failed to parse decrypted response from {path}: {decrypted[:200]}"
+            ) from err
+
     def _call_encrypted(
         self,
         method: str,
@@ -331,33 +382,135 @@ class IrrisenseApi:
         timeout: int = 30,
         retry_login: bool = True,
     ) -> dict:
-        """Call an Aiper REST endpoint using the AES/RSA envelope."""
-        enc = AiperEncryption()
-        headers = dict(self._session.headers)
-        headers["encryptKey"] = enc.encrypt_key_header
-        headers["token"] = token or (self._token or "")
-
-        url_base = (base_url or self.base_url).rstrip("/")
-        url = f"{url_base}{path}"
-
-        data = None
-        if body is not None:
-            data = enc.encrypt_request(body)
+        """Synchronous encrypted REST call (auth / AWS-credential chain)."""
+        enc, url, headers, data = self._build_encrypted_request(
+            path, body, base_url=base_url, token=token
+        )
 
         resp = self._request_with_backoff(method, url, headers=headers, data=data, timeout=timeout)
-        decrypted = enc.decrypt_response(resp.text)
-
-        try:
-            payload = json.loads(decrypted)
-        except Exception as err:
-            raise Exception(
-                f"Failed to parse decrypted response from {path}: {decrypted[:200]}"
-            ) from err
+        payload = self._decode_encrypted_response(enc, path, resp.text)
 
         if retry_login and str(payload.get("code")) in ("401", "403"):
             _LOGGER.info("Token expired; refreshing")
             if self.refresh_token() or self.login():
                 return self._call_encrypted(
+                    method, path, body,
+                    base_url=base_url, token=self._token,
+                    timeout=timeout, retry_login=False,
+                )
+
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # Async device-data REST (aiohttp)
+    # ------------------------------------------------------------------ #
+
+    def attach_async_session(self, session: aiohttp.ClientSession) -> None:
+        """Attach the aiohttp session used for async device-data calls.
+
+        The coordinator passes Home Assistant's shared session here so we don't
+        create (and leak) our own.
+        """
+        self._async_session = session
+        self._owns_async_session = False
+
+    def _get_async_session(self) -> aiohttp.ClientSession:
+        if self._async_session is None:
+            # Fallback for non-HA callers / tests: self-owned session, closed
+            # in disconnect().
+            self._async_session = aiohttp.ClientSession()
+            self._owns_async_session = True
+        return self._async_session
+
+    async def _async_rest_wait(self) -> None:
+        """Async twin of :meth:`_rest_wait` — same ``_rest_min_interval``
+        spacing, sharing the ``_rest_next_allowed`` window with the sync path.
+        """
+        async with self._async_rest_lock:
+            now = time.time()
+            if now < self._rest_next_allowed:
+                await asyncio.sleep(self._rest_next_allowed - now)
+            self._rest_next_allowed = time.time() + self._rest_min_interval
+
+    async def _async_request_with_backoff(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        data: Any = None,
+        timeout: int = 30,
+    ) -> str:
+        """Async twin of :meth:`_request_with_backoff`. Returns the response
+        text. Same retry policy (4 attempts, exp backoff, transient-only)."""
+        max_attempts = 4
+        delay = 1.0
+        last_exc: Exception | None = None
+        session = self._get_async_session()
+        for attempt in range(1, max_attempts + 1):
+            await self._async_rest_wait()
+            try:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    data=data,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status in (429, 500, 502, 503, 504):
+                        raise Exception(f"HTTP {resp.status}")
+                    resp.raise_for_status()
+                    return await resp.text()
+            except Exception as err:
+                last_exc = err
+                msg = str(err).lower()
+                transient = any(
+                    k in msg
+                    for k in (
+                        "429", "500", "502", "503", "504",
+                        "timeout", "tempor", "connection", "reset", "refused",
+                    )
+                )
+                if attempt >= max_attempts or not transient:
+                    break
+                await asyncio.sleep(delay + random.uniform(0, 0.3))
+                delay = min(delay * 2.0, 8.0)
+        raise last_exc if last_exc else Exception("Request failed")
+
+    async def _async_call_encrypted(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        base_url: str | None = None,
+        token: str | None = None,
+        timeout: int = 30,
+        retry_login: bool = True,
+    ) -> dict:
+        """Asynchronous encrypted REST call (device-data endpoints).
+
+        Uses the SAME wire builder + response decoder as the sync path. Token
+        refresh on 401/403 hops to the executor because the auth chain
+        (refresh_token / login) is synchronous.
+        """
+        enc, url, headers, data = self._build_encrypted_request(
+            path, body, base_url=base_url, token=token
+        )
+
+        text = await self._async_request_with_backoff(
+            method, url, headers=headers, data=data, timeout=timeout
+        )
+        payload = self._decode_encrypted_response(enc, path, text)
+
+        if retry_login and str(payload.get("code")) in ("401", "403"):
+            _LOGGER.info("Token expired; refreshing (async path)")
+            loop = asyncio.get_running_loop()
+            refreshed = await loop.run_in_executor(
+                None, lambda: self.refresh_token() or self.login()
+            )
+            if refreshed:
+                return await self._async_call_encrypted(
                     method, path, body,
                     base_url=base_url, token=self._token,
                     timeout=timeout, retry_login=False,
@@ -470,10 +623,10 @@ class IrrisenseApi:
     # Device discovery / shared endpoints
     # ------------------------------------------------------------------ #
 
-    def get_devices(self) -> list[dict]:
+    async def get_devices(self) -> list[dict]:
         """List all devices on the account and filter for Irrisense units."""
         try:
-            payload = self._call_encrypted("POST", "/equipment/getEquipment", {})
+            payload = await self._async_call_encrypted("POST", "/equipment/getEquipment", {})
             if not self._is_success(payload):
                 _LOGGER.warning("get_devices failed: %s", payload.get("code"))
                 return []
@@ -528,10 +681,10 @@ class IrrisenseApi:
     # Irrisense-specific REST endpoints (all under /wr/)
     # ------------------------------------------------------------------ #
 
-    def _wr(self, path: str, body: dict | None = None) -> dict | None:
+    async def _wr(self, path: str, body: dict | None = None) -> dict | None:
         """Helper: POST to a /wr/... endpoint and return data payload on success."""
         try:
-            payload = self._call_encrypted("POST", path, body or {})
+            payload = await self._async_call_encrypted("POST", path, body or {})
             if self._is_success(payload):
                 return payload.get("data") if isinstance(payload, dict) else None
             _LOGGER.debug(
@@ -547,30 +700,30 @@ class IrrisenseApi:
         return None
 
     # -- Reads --
-    def get_wr_equipment_info(self, sn: str) -> dict | None:
+    async def get_wr_equipment_info(self, sn: str) -> dict | None:
         """Irrisense-specific status (firmware, battery, active zone, etc.)."""
-        return self._wr("/wr/getEquipmentInfo", {"sn": sn})
+        return await self._wr("/wr/getEquipmentInfo", {"sn": sn})
 
-    def get_map_list(self, sn: str) -> dict | None:
+    async def get_map_list(self, sn: str) -> dict | None:
         """Returns the S3 URL for the zone map JSON."""
-        return self._wr("/wr/getMapList", {"sn": sn})
+        return await self._wr("/wr/getMapList", {"sn": sn})
 
-    def get_watering_task_list(self, sn: str) -> dict | None:
-        return self._wr("/wr/getWateringTaskListV2", {"sn": sn})
+    async def get_watering_task_list(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getWateringTaskListV2", {"sn": sn})
 
-    def get_watering_setting(self, sn: str) -> dict | None:
-        return self._wr("/wr/getWateringSettingV2", {"sn": sn})
+    async def get_watering_setting(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getWateringSettingV2", {"sn": sn})
 
-    def get_nozzle_type_setting(self, sn: str) -> dict | None:
-        return self._wr("/wr/getNozzleTypeSetting", {"sn": sn})
+    async def get_nozzle_type_setting(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getNozzleTypeSetting", {"sn": sn})
 
-    def get_reminder_setting(self, sn: str) -> dict | None:
-        return self._wr("/wr/getReminderSetting", {"sn": sn})
+    async def get_reminder_setting(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getReminderSetting", {"sn": sn})
 
-    def get_watering_statistics(self, sn: str) -> dict | None:
-        return self._wr("/wr/wateringRecordStatisticsV2", {"sn": sn})
+    async def get_watering_statistics(self, sn: str) -> dict | None:
+        return await self._wr("/wr/wateringRecordStatisticsV2", {"sn": sn})
 
-    def get_watering_history(self, sn: str, page: int = 1, size: int = 20) -> dict | None:
+    async def get_watering_history(self, sn: str, page: int = 1, size: int = 20) -> dict | None:
         # Backend returns code=6002 when required fields are missing. Try a
         # couple of known body shapes; the mobile app sends date windows.
         now_ms = int(time.time() * 1000)
@@ -594,7 +747,7 @@ class IrrisenseApi:
             order = [cached] + [i for i in order if i != cached]
 
         for i in order:
-            result = self._wr("/wr/getWateringRecordHistoryDataV2", bodies[i])
+            result = await self._wr("/wr/getWateringRecordHistoryDataV2", bodies[i])
             if result is not None:
                 self._history_body_idx[sn] = i
                 return result
@@ -603,14 +756,14 @@ class IrrisenseApi:
         self._history_body_idx.pop(sn, None)
         return None
 
-    def get_drainage_reminder(self, sn: str) -> dict | None:
-        return self._wr("/wr/getDrainageReminderPopup", {"sn": sn})
+    async def get_drainage_reminder(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getDrainageReminderPopup", {"sn": sn})
 
-    def get_map_pesticide_usage(self, sn: str) -> dict | None:
-        return self._wr("/wr/getMapPesticideUsage", {"sn": sn})
+    async def get_map_pesticide_usage(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getMapPesticideUsage", {"sn": sn})
 
-    def get_skip_history(self, sn: str) -> dict | None:
-        return self._wr("/wr/getWateringTaskSkipRecordHistoryDataV2", {"sn": sn})
+    async def get_skip_history(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getWateringTaskSkipRecordHistoryDataV2", {"sn": sn})
 
     @staticmethod
     def _parse_regions(zmap: dict | None) -> list[dict[str, Any]]:
@@ -655,7 +808,14 @@ class IrrisenseApi:
         Left in place for diagnostics / non-HA callers. Returns the raw JSON
         dict on success.
         """
-        info = self.get_map_list(sn)
+        # Sync path: the async get_map_list can't be awaited here, so issue the
+        # encrypted getMapList directly via the synchronous sender.
+        try:
+            payload = self._call_encrypted("POST", "/wr/getMapList", {"sn": sn})
+            info = payload.get("data") if self._is_success(payload) else None
+        except Exception as err:  # noqa: BLE001 - diagnostic helper
+            _LOGGER.warning("getMapList (sync) failed for %s: %s", sn, err)
+            info = None
         if info is None:
             return None
 
@@ -690,11 +850,10 @@ class IrrisenseApi:
         body is returned. aiohttp does not invoke that parser, so the plain
         JSON body comes through intact.
 
-        ``get_map_list`` is a sync encrypted REST call; we still run it on
-        the executor. The S3 GET is pure aiohttp.
+        ``get_map_list`` is now an async encrypted REST call (awaited
+        directly); the S3 GET uses the passed-in aiohttp session.
         """
-        loop = loop or asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, self.get_map_list, sn)
+        info = await self.get_map_list(sn)
         if info is None:
             return None
 
@@ -725,15 +884,15 @@ class IrrisenseApi:
             return None
 
     # -- Writes --
-    def set_schedule_enabled(self, sn: str, task_ids: list[int], enabled: bool) -> bool:
+    async def set_schedule_enabled(self, sn: str, task_ids: list[int], enabled: bool) -> bool:
         body = {"sn": sn, "taskIds": task_ids, "enabled": 1 if enabled else 0}
-        return self._wr("/wr/batchUpdateWrWateringTaskEnabledV2", body) is not None
+        return await self._wr("/wr/batchUpdateWrWateringTaskEnabledV2", body) is not None
 
-    def set_watering_setting(self, sn: str, settings: dict[str, Any]) -> bool:
+    async def set_watering_setting(self, sn: str, settings: dict[str, Any]) -> bool:
         body = {"sn": sn, **settings}
-        return self._wr("/wr/updateWateringSetting", body) is not None
+        return await self._wr("/wr/updateWateringSetting", body) is not None
 
-    def set_nozzle_type(self, sn: str, nozzle_type: int) -> bool:
+    async def set_nozzle_type(self, sn: str, nozzle_type: int) -> bool:
         # The `/wr/updateNozzleTypeSetting` REST endpoint uses a 1-indexed
         # mapping: 1 = Standard, 2 = Jet. Our device-side representation
         # (matches the iOS UI + MQTT shadow) is 0 = Standard, 1 = Jet — see
@@ -741,21 +900,21 @@ class IrrisenseApi:
         #     updateNozzleTypeSetting(sn, value == 1 ? 2 : 1)
         server_value = 2 if int(nozzle_type) == 1 else 1
         body = {"sn": sn, "nozzleType": server_value}
-        return self._wr("/wr/updateNozzleTypeSetting", body) is not None
+        return await self._wr("/wr/updateNozzleTypeSetting", body) is not None
 
-    def set_water_shortage_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_water_shortage_reminder(self, sn: str, enabled: bool) -> bool:
         body = {"sn": sn, "waterShortageReminder": 1 if enabled else 0}
-        return self._wr("/wr/updateWaterShortageReminderSetting", body) is not None
+        return await self._wr("/wr/updateWaterShortageReminderSetting", body) is not None
 
-    def set_task_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_task_reminder(self, sn: str, enabled: bool) -> bool:
         body = {"sn": sn, "taskReminder": 1 if enabled else 0}
-        return self._wr("/wr/updateTaskReminderSetting", body) is not None
+        return await self._wr("/wr/updateTaskReminderSetting", body) is not None
 
-    def set_pesticide_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_pesticide_reminder(self, sn: str, enabled: bool) -> bool:
         body = {"sn": sn, "pesticideReminder": 1 if enabled else 0}
-        return self._wr("/wr/updatePesticideReminderSetting", body) is not None
+        return await self._wr("/wr/updatePesticideReminderSetting", body) is not None
 
-    def set_drainage_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_drainage_reminder(self, sn: str, enabled: bool) -> bool:
         """Drainage reminder lives under `updateTaskReminderSetting` in the
         mobile app (shared endpoint toggles all four), but we also try a
         dedicated endpoint first in case the backend exposes one.
@@ -764,9 +923,9 @@ class IrrisenseApi:
         # No known dedicated endpoint yet — send as a field update on the
         # generic reminder setter if it exists; otherwise fall back to the
         # watering-setting path (some backends accept reminder keys there).
-        result = self._wr("/wr/updateDrainageReminderSetting", body)
+        result = await self._wr("/wr/updateDrainageReminderSetting", body)
         if result is None:
-            result = self._wr("/wr/updateTaskReminderSetting", body)
+            result = await self._wr("/wr/updateTaskReminderSetting", body)
         return result is not None
 
     # ------------------------------------------------------------------ #
@@ -1369,4 +1528,15 @@ class IrrisenseApi:
             self._session.close()
         except Exception:
             pass
+        # Only close a self-owned aiohttp session; Home Assistant's shared
+        # session (attached via attach_async_session) must never be closed here.
+        if self._owns_async_session and self._async_session is not None:
+            session, self._async_session = self._async_session, None
+            self._owns_async_session = False
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and not session.closed:
+                loop.create_task(session.close())
         _LOGGER.info("Irrisense API disconnected")
