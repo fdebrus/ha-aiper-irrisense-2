@@ -21,3 +21,8 @@ pytest-homeassistant-custom-component
 # bootstrap; ship the IANA database so that works on minimal images whose
 # system zoneinfo is incomplete.
 tzdata
+
+# The integration now uses paho-mqtt 2.x (CallbackAPIVersion / VERSION2 API).
+# Older Home Assistant test pins pull paho-mqtt 1.6.x, so force 2.x here for
+# the MQTT tests. (HA's own mqtt component isn't exercised by this suite.)
+paho-mqtt>=2.1.0

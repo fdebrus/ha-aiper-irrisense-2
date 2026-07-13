@@ -8,7 +8,7 @@
   "iot_class": "cloud_polling",
   "version": "0.3.0",
   "requirements": [
-    "AWSIoTPythonSDK>=1.5.0",
+    "paho-mqtt>=2.1.0",
     "certifi>=2024.0.0",
     "requests>=2.31.0"
   ]
