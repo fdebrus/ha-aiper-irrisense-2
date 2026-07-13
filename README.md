@@ -44,7 +44,7 @@ use them in automations and dashboards.
 ### HACS (recommended)
 
 1. In HACS → **Integrations** → top-right menu → **Custom repositories**.
-2. Add `https://github.com/Merlz/ha-aiper-irrisense-2` with category
+2. Add `https://github.com/fdebrus/ha-aiper-irrisense-2` with category
    **Integration**.
 3. Install **Aiper Irrisense 2** from the HACS list.
 4. Restart Home Assistant.
