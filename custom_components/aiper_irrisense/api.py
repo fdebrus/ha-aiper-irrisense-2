@@ -206,6 +206,9 @@ class IrrisenseApi:
         # Device cache
         self._devices: dict[str, dict] = {}
         self._device_zone_id_by_sn: dict[str, str] = {}
+        # Which of the get_watering_history body shapes the backend accepted
+        # for a given SN, so we don't re-brute-force all four every refresh.
+        self._history_body_idx: dict[str, int] = {}
 
         # MQTT subscription callbacks
         self._shadow_callbacks: dict[str, list[Callable]] = {}
@@ -580,10 +583,24 @@ class IrrisenseApi:
             {"sn": sn, "startTime": now_ms - month_ms, "endTime": now_ms,
              "pageNo": page, "pageSize": size, "type": 0},
         ]
-        for body in bodies:
-            result = self._wr("/wr/getWateringRecordHistoryDataV2", body)
+
+        # Try the shape that worked last time for this SN first; fall back to
+        # the full sweep (in the original order) on a cache miss. The bodies
+        # themselves are unchanged, and the first-ever call for an SN — before
+        # anything is cached — still tries them in the exact original order.
+        cached = self._history_body_idx.get(sn)
+        order = list(range(len(bodies)))
+        if cached is not None and 0 <= cached < len(bodies):
+            order = [cached] + [i for i in order if i != cached]
+
+        for i in order:
+            result = self._wr("/wr/getWateringRecordHistoryDataV2", bodies[i])
             if result is not None:
+                self._history_body_idx[sn] = i
                 return result
+        # Nothing worked this pass — drop any stale cache so the next refresh
+        # sweeps fresh rather than re-trying a shape the backend now rejects.
+        self._history_body_idx.pop(sn, None)
         return None
 
     def get_drainage_reminder(self, sn: str) -> dict | None:
