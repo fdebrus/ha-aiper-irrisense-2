@@ -1188,7 +1188,14 @@ class IrrisenseApi:
         try:
             with self._cmd_locks[sn]:
                 self._mqtt_client.publish(topic, message, 1)
-            _LOGGER.info("MQTT PUB → %s  (%d bytes)  %s", topic, len(message), message)
+            # Byte-for-byte publish record. High-volume on the always-on
+            # command path (every start/stop), so keep it at INFO only when
+            # mqtt_debug is enabled; otherwise emit at DEBUG so it stays
+            # reachable via logger config without spamming shipping logs.
+            if self.mqtt_debug:
+                _LOGGER.info("MQTT PUB → %s  (%d bytes)  %s", topic, len(message), message)
+            else:
+                _LOGGER.debug("MQTT PUB → %s  (%d bytes)  %s", topic, len(message), message)
 
             # Record outbound timestamp so the ACK watchdog can detect a
             # silent drop. We intentionally only watch command types that
