@@ -30,6 +30,9 @@ IRRISENSE_MODEL: Final = "IrriSense_2"
 CONF_REGION: Final = "region"
 CONF_ENABLE_MQTT: Final = "enable_mqtt"
 CONF_MQTT_DEBUG: Final = "mqtt_debug"
+# Gates the diagnostic `debug_publish` service (arbitrary raw MQTT publish).
+# Off by default so the raw-publish hatch is opt-in.
+CONF_ADVANCED_DIAGNOSTICS: Final = "advanced_diagnostics"
 CONF_POLL_INTERVAL: Final = "poll_interval"
 CONF_MAP_REFRESH_HOURS: Final = "map_refresh_hours"
 CONF_HISTORY_REFRESH_HOURS: Final = "history_refresh_hours"

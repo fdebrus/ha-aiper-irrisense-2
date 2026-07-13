@@ -14,6 +14,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .api import IrrisenseApi
 from .const import (
+    CONF_ADVANCED_DIAGNOSTICS,
     CONF_ENABLE_MQTT,
     CONF_HISTORY_REFRESH_HOURS,
     CONF_MAP_REFRESH_HOURS,
@@ -160,6 +161,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_MQTT_DEBUG,
                     default=current.get(CONF_MQTT_DEBUG, False),
+                ): bool,
+                vol.Optional(
+                    CONF_ADVANCED_DIAGNOSTICS,
+                    default=current.get(CONF_ADVANCED_DIAGNOSTICS, False),
                 ): bool,
                 vol.Optional(
                     CONF_POLL_INTERVAL,
