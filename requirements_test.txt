@@ -1,0 +1,23 @@
+# Development / CI test dependencies ONLY.
+#
+# These are intentionally kept OUT of custom_components/aiper_irrisense/
+# manifest.json "requirements" — Home Assistant installs manifest
+# requirements into every user's runtime, and the test harness must never
+# ship to end users.
+#
+# pytest-homeassistant-custom-component pins a matching Home Assistant
+# version and pulls in pytest + the HA test helpers (hass fixture, etc.).
+# Install locally / in CI with:
+#
+#     pip install -r requirements_test.txt
+#
+# Left unpinned so each environment resolves the newest plugin its Python
+# supports (the plugin gates on Python version: 0.13.109 is the last release
+# that runs on Python 3.11; 0.13.110+ require 3.12, and later builds 3.13+).
+# CI runs on a modern Python so it exercises a current Home Assistant.
+pytest-homeassistant-custom-component
+
+# The HA test harness sets a US/Pacific default time zone during hass
+# bootstrap; ship the IANA database so that works on minimal images whose
+# system zoneinfo is incomplete.
+tzdata
