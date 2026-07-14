@@ -19,8 +19,7 @@ import logging
 import random
 import threading
 import time
-import weakref
-from collections import defaultdict, deque
+from collections import defaultdict
 from typing import Any, Callable
 
 import aiohttp
@@ -58,96 +57,16 @@ _LOGGER = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Crash-shield race fix
+# MQTT transport
 # --------------------------------------------------------------------------- #
-# The AWSIoT paho loop thread dies with
-#   AttributeError: 'NoneType' object has no attribute 'pending'
-# whenever the socket is torn down under it (duplicate-clientId eviction from
-# the phone app, or our own deliberate disconnect during recovery). We rely on
-# a threading.excepthook to detect that and recreate the client.
-#
-# Install exactly one process-wide hook, track live IrrisenseApi instances in
-# a WeakSet, and dispatch each paho-crash to AT MOST ONE live instance. Each
-# instance also has an "expected-death" counter so our own crash-shield-
-# initiated disconnects don't re-enter the recovery path.
+# We connect to AWS IoT with paho-mqtt over a SigV4-signed WebSocket (see
+# aws_sigv4.py). paho 2.x surfaces socket teardown cleanly via its
+# ``on_disconnect`` callback, so — unlike the old AWSIoTPythonSDK path, whose
+# loop thread died with an unhandled AttributeError on eviction — no
+# process-wide ``threading.excepthook`` crash shield is required. Reconnection
+# (with a freshly re-signed URL each attempt) is handled by a small supervisor
+# thread started from ``on_disconnect``.
 # --------------------------------------------------------------------------- #
-
-_GLOBAL_HOOK_LOCK = threading.Lock()
-_GLOBAL_HOOK_INSTALLED = False
-_LIVE_API_INSTANCES: "weakref.WeakSet[IrrisenseApi]" = weakref.WeakSet()
-
-
-def _irrisense_excepthook_dispatcher(prior_hook):
-    """Build the single excepthook we'll ever install.
-
-    Captures `prior_hook` (whatever `threading.excepthook` was before us) so
-    we can chain back to it for non-paho exceptions and for HA's own logger.
-    """
-
-    def _hook(args: threading.ExceptHookArgs) -> None:
-        try:
-            exc = args.exc_value
-            thread = args.thread
-            is_paho = bool(
-                thread is not None and "thread_main" in (thread.name or "")
-            )
-            is_socket_teardown = bool(
-                isinstance(exc, AttributeError)
-                and exc is not None
-                and "'NoneType'" in str(exc)
-            )
-            if is_paho or is_socket_teardown:
-                # Dispatch to exactly ONE live instance. Prefer the one with
-                # a currently-owned client; fall back to any live instance
-                # that's mid-recovery; otherwise ignore (it's a ghost crash
-                # from an instance that's already gone).
-                target: IrrisenseApi | None = None
-                candidates = list(_LIVE_API_INSTANCES)
-                for inst in candidates:
-                    if inst._mqtt_client is not None:
-                        target = inst
-                        break
-                if target is None:
-                    for inst in candidates:
-                        if inst._reconnecting:
-                            target = inst
-                            break
-                if target is not None:
-                    target._handle_paho_thread_death(exc)
-                else:
-                    _LOGGER.debug(
-                        "Paho loop thread died but no live Irrisense client "
-                        "to recover (probably a zombie from a torn-down "
-                        "config entry). Ignoring."
-                    )
-        except Exception as err:  # noqa: BLE001 — hook must never raise
-            _LOGGER.debug("Irrisense excepthook internal error: %s", err)
-
-        # Always chain to whatever was there before (HA's default logger, etc).
-        try:
-            prior_hook(args)
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Mark so we can detect "already installed by us" on future reloads.
-    _hook._irrisense_installed = True  # type: ignore[attr-defined]
-    return _hook
-
-
-def _ensure_global_excepthook_installed() -> None:
-    """Install the single process-wide excepthook exactly once."""
-    global _GLOBAL_HOOK_INSTALLED
-    with _GLOBAL_HOOK_LOCK:
-        current = threading.excepthook
-        if getattr(current, "_irrisense_installed", False):
-            _GLOBAL_HOOK_INSTALLED = True
-            return
-        if _GLOBAL_HOOK_INSTALLED:
-            # We installed it previously but someone replaced it. Reinstall,
-            # chaining onto whatever is there now.
-            pass
-        threading.excepthook = _irrisense_excepthook_dispatcher(current)
-        _GLOBAL_HOOK_INSTALLED = True
 
 
 def _find_map_url(obj: Any) -> str | None:
@@ -223,23 +142,15 @@ class IrrisenseApi:
         self._pending_ack: dict[tuple[str, str], float] = {}
         self._ack_timeout: float = 3.0
 
-        # Crash shield: track SNs we've subscribed to (plus the
-        # subscribing callback) so we can replay the subscription after a
-        # forced reconnect — either the SDK's own auto-reconnect (socket
-        # blip) or our thread-excepthook-driven recovery (paho loop death
-        # from duplicate-clientId eviction, etc).
+        # Track SNs we've subscribed to (plus the subscribing callback) so we
+        # can replay the subscription after any reconnect (paho fires
+        # `on_connect` again on each reconnect).
         self._subscribed: dict[str, Callable] = {}
+        # True while the reconnect supervisor thread is running.
         self._reconnecting = False
-        self._thread_excepthook_installed = False
-        # Count of paho thread crashes we *expect* because we ourselves
-        # called `old.disconnect()` during crash-shield recovery.
-        # Each expected death is swallowed without starting another worker.
-        self._expected_paho_deaths: int = 0
-
-        # Register this instance so the module-level excepthook dispatcher
-        # can find us. WeakSet auto-cleans after HA reload drops the ref.
-        _LIVE_API_INSTANCES.add(self)
-        _ensure_global_excepthook_installed()
+        # Set when we deliberately tear down (disconnect / unload) so the
+        # on_disconnect handler doesn't schedule a reconnect.
+        self._intentional_disconnect = False
 
         # REST session
         self._session = requests.Session()
@@ -773,25 +684,33 @@ class IrrisenseApi:
     # MQTT — AWS IoT WebSocket (SigV4)
     # ------------------------------------------------------------------ #
 
+    def _aws_iot_region(self) -> str:
+        region = self._aws_region
+        if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
+            region = self._iot_endpoint.split(".iot.", 1)[1].split(".", 1)[0]
+        return region or "eu-central-1"
+
+    def _build_ws_path(self, creds: dict[str, Any]) -> str:
+        """Return the SigV4-signed WebSocket request path (``/mqtt?...``)."""
+        from .aws_sigv4 import presign_iot_wss_url  # noqa: WPS433
+
+        url = presign_iot_wss_url(
+            self._iot_endpoint,
+            self._aws_iot_region(),
+            creds["AccessKeyId"],
+            creds["SecretKey"],
+            creds.get("SessionToken"),
+        )
+        # paho's ws_set_options wants everything after the host: "/mqtt?...".
+        return url.split(self._iot_endpoint, 1)[1]
+
     def connect_mqtt(self) -> bool:
         if not self._identity_id or not self._iot_endpoint:
             _LOGGER.error("No IoT identity/endpoint available")
             return False
         try:
-            from AWSIoTPythonSDK.MQTTLib import AWSIoTMQTTClient  # noqa: WPS433
+            import paho.mqtt.client as mqtt  # noqa: WPS433
             import certifi  # noqa: WPS433
-
-            # Surface the SDK's internal logger so PUBACK / CONNACK /
-            # SUBACK show up in HA logs. If our publishes aren't getting PUBACK
-            # from the broker, we know it's an AWS IoT policy issue rather than
-            # the device ignoring a delivered frame.
-            if self.mqtt_debug:
-                try:
-                    awsiot_log = logging.getLogger("AWSIoTPythonSDK.core")
-                    if awsiot_log.level == logging.NOTSET or awsiot_log.level > logging.INFO:
-                        awsiot_log.setLevel(logging.INFO)
-                except Exception:  # noqa: BLE001 - diagnostic only
-                    pass
 
             creds = self._get_aws_credentials()
             if not creds:
@@ -800,64 +719,46 @@ class IrrisenseApi:
 
             # ClientId must equal the Cognito identity_id verbatim (exact-match
             # AWS IoT policy). Co-existence with the iOS Aiper app is
-            # impossible; last CONNECT wins — any time the phone app opens,
-            # our session is evicted, the paho loop thread dies with an
-            # AttributeError on socket teardown (see the crash shield), and
-            # we auto-recover via the thread-excepthook handler below.
+            # impossible; last CONNECT wins — whenever the phone app opens, the
+            # broker evicts us. paho 2.x reports this cleanly via on_disconnect
+            # (no thread crash), and our reconnect supervisor re-signs + retries.
             client_id = self._identity_id
             _LOGGER.info("Irrisense MQTT client_id=%s", client_id)
-            self._mqtt_client = AWSIoTMQTTClient(client_id, useWebsocket=True)
-            self._mqtt_client.configureEndpoint(self._iot_endpoint, 443)
-            self._mqtt_client.configureCredentials(certifi.where())
-            self._mqtt_client.configureIAMCredentials(
-                creds["AccessKeyId"],
-                creds["SecretKey"],
-                creds.get("SessionToken", ""),
+
+            self._intentional_disconnect = False
+            client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                client_id=client_id,
+                transport="websockets",
             )
+            # We drive reconnection ourselves so each attempt gets a freshly
+            # re-signed SigV4 URL (paho would blindly reuse the stale one).
+            client.reconnect_on_failure = False
+            client.on_connect = self._on_connect
+            client.on_disconnect = self._on_disconnect
+            if self.mqtt_debug:
+                try:
+                    client.enable_logger(logging.getLogger("paho.mqtt.aiper"))
+                except Exception:  # noqa: BLE001 - diagnostic only
+                    pass
 
-            if hasattr(self._mqtt_client, "configureAWSRegion"):
-                region = self._aws_region
-                if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
-                    region = self._iot_endpoint.split(".iot.", 1)[1].split(".", 1)[0]
-                if region:
-                    try:
-                        self._mqtt_client.configureAWSRegion(region)
-                    except Exception:
-                        pass
+            client.ws_set_options(path=self._build_ws_path(creds))
+            client.tls_set(ca_certs=certifi.where())
 
-            self._mqtt_client.configureAutoReconnectBackoffTime(1, 8, 5)
-            self._mqtt_client.configureOfflinePublishQueueing(-1)
-            self._mqtt_client.configureDrainingFrequency(2)
-            self._mqtt_client.configureConnectDisconnectTimeout(30)
-            self._mqtt_client.configureMQTTOperationTimeout(10)
+            self._mqtt_client = client
+            client.connect(self._iot_endpoint, 443, keepalive=60)
+            client.loop_start()
 
-            # SDK-level online/offline visibility. These fire for both
-            # graceful reconnects (socket drop + rebind) and for the
-            # duplicate-clientId eviction path. We log at INFO so the
-            # ping-pong is obvious in shipping logs.
-            try:
-                self._mqtt_client.onOnline = self._on_mqtt_online
-                self._mqtt_client.onOffline = self._on_mqtt_offline
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Could not attach on/offline callbacks: %s", err)
-
-            # Crash shield for paho thread death. The SDK's paho loop lives
-            # in a daemon thread; if the socket is torn down unexpectedly
-            # (duplicate-clientId eviction), paho raises
-            # `AttributeError: 'NoneType' object has no attribute 'pending'`
-            # which bubbles out of the thread with no handler — thread dies,
-            # SDK's own auto-reconnect machinery dies with it, and we end up
-            # silently zombied. Install a threading.excepthook that detects
-            # this and triggers a clean recreate.
-            self._install_thread_excepthook()
-
-            if self._mqtt_client.connect():
-                self._mqtt_connected = True
-                _LOGGER.info("Connected to AWS IoT MQTT (Irrisense)")
-                return True
+            # Wait briefly for CONNACK (on_connect flips _mqtt_connected).
+            for _ in range(100):
+                if self._mqtt_connected:
+                    _LOGGER.info("Connected to AWS IoT MQTT (Irrisense)")
+                    return True
+                time.sleep(0.1)
+            _LOGGER.warning("MQTT connect timed out waiting for CONNACK")
             return False
         except ImportError:
-            _LOGGER.error("AWSIoTPythonSDK not installed")
+            _LOGGER.error("paho-mqtt not installed")
             return False
         except Exception as err:
             _LOGGER.exception("MQTT connection failed: %r", err)
@@ -867,167 +768,105 @@ class IrrisenseApi:
         return bool(self._mqtt_connected and self._mqtt_client)
 
     # ------------------------------------------------------------------ #
-    # Crash shield + online/offline visibility
+    # paho callbacks + reconnect supervisor
     # ------------------------------------------------------------------ #
 
-    def _on_mqtt_online(self) -> None:
-        """SDK callback: fires on initial connect AND after any reconnect."""
+    @staticmethod
+    def _rc_is_success(reason_code: Any) -> bool:
+        """True if a paho reason code / int indicates success."""
+        if reason_code is None:
+            return True
+        if isinstance(reason_code, int):
+            return reason_code == 0
+        # paho 2.x ReasonCode object
+        is_failure = getattr(reason_code, "is_failure", None)
+        if is_failure is not None:
+            return not is_failure
+        return int(getattr(reason_code, "value", 1)) == 0
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        """Fires on initial connect AND after every reconnect."""
+        if not self._rc_is_success(reason_code):
+            _LOGGER.warning("Irrisense MQTT connect refused: %s", reason_code)
+            return
+        self._mqtt_connected = True
         _LOGGER.info(
-            "Irrisense MQTT ONLINE (re)established. Replaying %d subscription(s).",
+            "Irrisense MQTT ONLINE. Replaying %d subscription(s).",
             len(self._subscribed),
         )
-        self._mqtt_connected = True
-        # SDK preserves subs across its own reconnects, but a full recreate
-        # via our crash-shield path needs them replayed explicitly.
+        # Replay every remembered subscription — paho does not restore them
+        # across a fresh connect.
         for sn, cb in list(self._subscribed.items()):
             try:
                 self.subscribe_device(sn, cb)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("Failed to replay subscription for %s: %s", sn, err)
 
-    def _on_mqtt_offline(self) -> None:
-        """SDK callback: fires when the socket drops (before any reconnect attempt)."""
-        _LOGGER.warning(
-            "Irrisense MQTT OFFLINE — socket dropped. "
-            "Most common cause: the Aiper phone app just connected with the "
-            "same Cognito identityId and AWS IoT evicted us. The SDK will "
-            "attempt auto-reconnect; if the paho loop crashed, the "
-            "thread-excepthook shield will recreate the client."
-        )
-        self._mqtt_connected = False
-
-    def _install_thread_excepthook(self) -> None:
-        """Legacy shim — kept so existing call sites in connect_mqtt keep
-        working. The real work is done once per process by
-        `_ensure_global_excepthook_installed()` in `__init__`. This method
-        now just guarantees the global hook is in place (in case some
-        downstream code swapped it out at runtime).
+    def _on_disconnect(self, client, userdata, *args) -> None:
+        """Fires when the socket drops. paho 2.x passes
+        ``(client, userdata, disconnect_flags, reason_code, properties)``;
+        accept ``*args`` so minor signature differences don't break us.
         """
-        if self._thread_excepthook_installed:
+        self._mqtt_connected = False
+        reason_code = None
+        for a in args:
+            # reason_code is the arg that looks like an int / ReasonCode.
+            if isinstance(a, int) or hasattr(a, "is_failure"):
+                reason_code = a
+        if self._intentional_disconnect:
+            _LOGGER.debug("Irrisense MQTT disconnected (intentional).")
             return
-        self._thread_excepthook_installed = True
-        _ensure_global_excepthook_installed()
+        _LOGGER.warning(
+            "Irrisense MQTT OFFLINE (rc=%s). Most common cause: the Aiper phone "
+            "app connected with the same Cognito identityId and AWS IoT evicted "
+            "us. Scheduling reconnect.",
+            reason_code,
+        )
+        self._schedule_reconnect()
 
-    def _handle_paho_thread_death(self, exc: BaseException | None) -> None:
-        """Single entry point called by the module-level excepthook.
-
-        Runs in the dying thread's context. Responsibilities:
-
-        1. If we just tore the old client down ourselves (recovery in
-           progress), consume one expected-death and return — do NOT spawn
-           another worker.
-        2. If we're already reconnecting for any other reason, skip.
-        3. If our client is already None, there's nothing to recover.
-        4. Otherwise spawn the crash-shield recovery worker.
+    def _schedule_reconnect(self) -> None:
+        """Start the reconnect supervisor (one at a time). Each attempt
+        re-signs a fresh SigV4 URL — temporary credentials rotate, so the
+        previous URL cannot simply be reused.
         """
         with self._lock:
-            if self._expected_paho_deaths > 0:
-                self._expected_paho_deaths -= 1
-                _LOGGER.debug(
-                    "Expected paho thread death absorbed (crash-shield "
-                    "recovery). Remaining pending: %d",
-                    self._expected_paho_deaths,
-                )
-                return
             if self._reconnecting:
-                _LOGGER.debug(
-                    "Paho thread died while already reconnecting — ignoring "
-                    "duplicate crash."
-                )
-                return
-            if self._mqtt_client is None:
-                _LOGGER.debug(
-                    "Paho thread died but _mqtt_client is already None; "
-                    "nothing to recover."
-                )
                 return
             self._reconnecting = True
 
-        _LOGGER.warning(
-            "MQTT paho loop thread died (%s: %s) — triggering crash-shield "
-            "reconnect.",
-            type(exc).__name__ if exc else "?",
-            exc,
-        )
-        self._mqtt_connected = False
-        self._spawn_crash_shield_worker()
-
-    # Kept under the old name for any external callers (e.g. tests) that may
-    # still reference it.
-    def _handle_mqtt_thread_death(self) -> None:  # pragma: no cover
-        self._handle_paho_thread_death(None)
-
-    def _spawn_crash_shield_worker(self) -> None:
-        """Spawn the daemon thread that recreates the MQTT client."""
-
         def _worker() -> None:
+            delay = 1.0
             try:
-                # Short backoff — enough for the evicting peer's CONNECT
-                # to settle so we don't immediately trip again.
-                time.sleep(5.0)
-                # Drop the old client reference; its internals are now
-                # in an inconsistent state (dead thread, possibly stale
-                # sockets). A fresh AWSIoTMQTTClient is cheap.
-                old = None
-                try:
-                    old = self._mqtt_client
-                    self._mqtt_client = None
-                except Exception:  # noqa: BLE001
-                    pass
-
-                if old is not None:
-                    # Our own disconnect will cause the old paho thread's
-                    # `socket().pending()` to raise AttributeError as it
-                    # unwinds. Pre-register ONE expected death so the
-                    # excepthook swallows it instead of spawning _worker_B.
-                    with self._lock:
-                        self._expected_paho_deaths += 1
-                    # Trim the disconnect timeout on the old client — it's
-                    # already dead, waiting 30 s just blocks us from
-                    # recreating. 5 s is plenty for a best-effort tear-down.
+                while not self._intentional_disconnect and not self._mqtt_connected:
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, 8.0)
+                    if self._mqtt_client is None:
+                        return
                     try:
-                        if hasattr(old, "configureConnectDisconnectTimeout"):
-                            old.configureConnectDisconnectTimeout(5)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    try:
-                        old.disconnect()
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                _LOGGER.info("Crash-shield: recreating MQTT client...")
-                ok = self.connect_mqtt()
-                if not ok:
-                    _LOGGER.warning(
-                        "Crash-shield: reconnect attempt failed; will retry "
-                        "on next publish or scheduled poll."
-                    )
-                    return
-                # connect_mqtt() sets _mqtt_connected via onOnline which also
-                # replays subscriptions; nothing more to do here.
+                        creds = self._get_aws_credentials()
+                        if not creds:
+                            _LOGGER.debug("Reconnect: no AWS credentials yet")
+                            continue
+                        self._mqtt_client.ws_set_options(
+                            path=self._build_ws_path(creds)
+                        )
+                        self._mqtt_client.reconnect()
+                        # Give CONNACK a moment; _on_connect flips the flag.
+                        for _ in range(50):
+                            if self._mqtt_connected or self._intentional_disconnect:
+                                break
+                            time.sleep(0.1)
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug("MQTT reconnect attempt failed: %s", err)
+                if self._mqtt_connected:
+                    _LOGGER.info("Irrisense MQTT reconnected.")
             finally:
-                # Give the old paho thread a moment to finish dying so any
-                # straggler AttributeError gets absorbed by the expected-
-                # death counter instead of bleeding past the finally block.
-                time.sleep(0.5)
                 with self._lock:
                     self._reconnecting = False
-                    # If we counted a death that never arrived (paho exited
-                    # cleanly), don't carry the debt into the next cycle.
-                    if self._expected_paho_deaths > 0:
-                        _LOGGER.debug(
-                            "Clearing %d unused expected-death credit(s) at "
-                            "end of recovery cycle.",
-                            self._expected_paho_deaths,
-                        )
-                        self._expected_paho_deaths = 0
 
-        t = threading.Thread(
-            target=_worker,
-            name="irrisense-mqtt-recover",
-            daemon=True,
-        )
-        t.start()
+        threading.Thread(
+            target=_worker, name="irrisense-mqtt-reconnect", daemon=True
+        ).start()
 
     def request_shadow(self, sn: str) -> bool:
         if not self.is_mqtt_connected():
@@ -1150,7 +989,10 @@ class IrrisenseApi:
                 TOPIC_SHADOW_UPDATE_DOCUMENTS.format(sn=sn),
             ]
             for t in topics:
-                self._mqtt_client.subscribe(t, 1, on_message)
+                # paho routes messages to a per-topic callback registered via
+                # message_callback_add; subscribe() only installs the filter.
+                self._mqtt_client.message_callback_add(t, on_message)
+                self._mqtt_client.subscribe(t, 1)
                 _LOGGER.debug("Subscribed to %s", t)
             return True
         except Exception as err:
@@ -1359,9 +1201,16 @@ class IrrisenseApi:
     # ------------------------------------------------------------------ #
 
     def disconnect(self) -> None:
-        if self._mqtt_client and self._mqtt_connected:
+        # Signal the on_disconnect handler + reconnect supervisor to stand down.
+        self._intentional_disconnect = True
+        if self._mqtt_client:
             try:
                 self._mqtt_client.disconnect()
+            except Exception:
+                pass
+            try:
+                # Stop paho's network loop thread started by loop_start().
+                self._mqtt_client.loop_stop()
             except Exception:
                 pass
             self._mqtt_connected = False
