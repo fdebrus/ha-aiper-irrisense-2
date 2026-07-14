@@ -19,8 +19,7 @@ import logging
 import random
 import threading
 import time
-import weakref
-from collections import defaultdict, deque
+from collections import defaultdict
 from typing import Any, Callable
 
 import aiohttp
@@ -59,96 +58,16 @@ _LOGGER = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Crash-shield race fix
+# MQTT transport
 # --------------------------------------------------------------------------- #
-# The AWSIoT paho loop thread dies with
-#   AttributeError: 'NoneType' object has no attribute 'pending'
-# whenever the socket is torn down under it (duplicate-clientId eviction from
-# the phone app, or our own deliberate disconnect during recovery). We rely on
-# a threading.excepthook to detect that and recreate the client.
-#
-# Install exactly one process-wide hook, track live IrrisenseApi instances in
-# a WeakSet, and dispatch each paho-crash to AT MOST ONE live instance. Each
-# instance also has an "expected-death" counter so our own crash-shield-
-# initiated disconnects don't re-enter the recovery path.
+# We connect to AWS IoT with paho-mqtt over a SigV4-signed WebSocket (see
+# aws_sigv4.py). paho 2.x surfaces socket teardown cleanly via its
+# ``on_disconnect`` callback, so — unlike the old AWSIoTPythonSDK path, whose
+# loop thread died with an unhandled AttributeError on eviction — no
+# process-wide ``threading.excepthook`` crash shield is required. Reconnection
+# (with a freshly re-signed URL each attempt) is handled by a small supervisor
+# thread started from ``on_disconnect``.
 # --------------------------------------------------------------------------- #
-
-_GLOBAL_HOOK_LOCK = threading.Lock()
-_GLOBAL_HOOK_INSTALLED = False
-_LIVE_API_INSTANCES: "weakref.WeakSet[IrrisenseApi]" = weakref.WeakSet()
-
-
-def _irrisense_excepthook_dispatcher(prior_hook):
-    """Build the single excepthook we'll ever install.
-
-    Captures `prior_hook` (whatever `threading.excepthook` was before us) so
-    we can chain back to it for non-paho exceptions and for HA's own logger.
-    """
-
-    def _hook(args: threading.ExceptHookArgs) -> None:
-        try:
-            exc = args.exc_value
-            thread = args.thread
-            is_paho = bool(
-                thread is not None and "thread_main" in (thread.name or "")
-            )
-            is_socket_teardown = bool(
-                isinstance(exc, AttributeError)
-                and exc is not None
-                and "'NoneType'" in str(exc)
-            )
-            if is_paho or is_socket_teardown:
-                # Dispatch to exactly ONE live instance. Prefer the one with
-                # a currently-owned client; fall back to any live instance
-                # that's mid-recovery; otherwise ignore (it's a ghost crash
-                # from an instance that's already gone).
-                target: IrrisenseApi | None = None
-                candidates = list(_LIVE_API_INSTANCES)
-                for inst in candidates:
-                    if inst._mqtt_client is not None:
-                        target = inst
-                        break
-                if target is None:
-                    for inst in candidates:
-                        if inst._reconnecting:
-                            target = inst
-                            break
-                if target is not None:
-                    target._handle_paho_thread_death(exc)
-                else:
-                    _LOGGER.debug(
-                        "Paho loop thread died but no live Irrisense client "
-                        "to recover (probably a zombie from a torn-down "
-                        "config entry). Ignoring."
-                    )
-        except Exception as err:  # noqa: BLE001 — hook must never raise
-            _LOGGER.debug("Irrisense excepthook internal error: %s", err)
-
-        # Always chain to whatever was there before (HA's default logger, etc).
-        try:
-            prior_hook(args)
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Mark so we can detect "already installed by us" on future reloads.
-    _hook._irrisense_installed = True  # type: ignore[attr-defined]
-    return _hook
-
-
-def _ensure_global_excepthook_installed() -> None:
-    """Install the single process-wide excepthook exactly once."""
-    global _GLOBAL_HOOK_INSTALLED
-    with _GLOBAL_HOOK_LOCK:
-        current = threading.excepthook
-        if getattr(current, "_irrisense_installed", False):
-            _GLOBAL_HOOK_INSTALLED = True
-            return
-        if _GLOBAL_HOOK_INSTALLED:
-            # We installed it previously but someone replaced it. Reinstall,
-            # chaining onto whatever is there now.
-            pass
-        threading.excepthook = _irrisense_excepthook_dispatcher(current)
-        _GLOBAL_HOOK_INSTALLED = True
 
 
 def _find_map_url(obj: Any) -> str | None:
@@ -224,29 +143,32 @@ class IrrisenseApi:
         self._pending_ack: dict[tuple[str, str], float] = {}
         self._ack_timeout: float = 3.0
 
-        # Crash shield: track SNs we've subscribed to (plus the
-        # subscribing callback) so we can replay the subscription after a
-        # forced reconnect — either the SDK's own auto-reconnect (socket
-        # blip) or our thread-excepthook-driven recovery (paho loop death
-        # from duplicate-clientId eviction, etc).
+        # Track SNs we've subscribed to (plus the subscribing callback) so we
+        # can replay the subscription after any reconnect (paho fires
+        # `on_connect` again on each reconnect).
         self._subscribed: dict[str, Callable] = {}
+        # True while the reconnect supervisor thread is running.
         self._reconnecting = False
-        self._thread_excepthook_installed = False
-        # Count of paho thread crashes we *expect* because we ourselves
-        # called `old.disconnect()` during crash-shield recovery.
-        # Each expected death is swallowed without starting another worker.
-        self._expected_paho_deaths: int = 0
+        # Set when we deliberately tear down (disconnect / unload) so the
+        # on_disconnect handler doesn't schedule a reconnect.
+        self._intentional_disconnect = False
 
-        # Register this instance so the module-level excepthook dispatcher
-        # can find us. WeakSet auto-cleans after HA reload drops the ref.
-        _LIVE_API_INSTANCES.add(self)
-        _ensure_global_excepthook_installed()
-
-        # REST session
+        # REST session. The synchronous `requests` session backs the auth /
+        # AWS-credential chain, which must be callable from the (non-event-loop)
+        # MQTT bootstrap + reconnect threads. Device-data calls use aiohttp via
+        # `_async_call_encrypted` and the shared async session below.
         self._session = requests.Session()
         self._rest_lock = threading.Lock()
         self._rest_min_interval = 0.8
         self._rest_next_allowed = 0.0
+        # aiohttp session for async device-data calls. Attached by the
+        # coordinator (Home Assistant's shared session) via
+        # `attach_async_session`; falls back to a self-owned session for
+        # non-HA callers. Both the sync and async paths share the same
+        # `_rest_next_allowed` spacing window.
+        self._async_session: aiohttp.ClientSession | None = None
+        self._owns_async_session = False
+        self._async_rest_lock = asyncio.Lock()
         self._session.headers.update(
             {
                 "Content-Type": "application/json",
@@ -321,6 +243,46 @@ class IrrisenseApi:
                 delay = min(delay * 2.0, 8.0)
         raise last_exc if last_exc else Exception("Request failed")
 
+    def _build_encrypted_request(
+        self,
+        path: str,
+        body: dict | None,
+        *,
+        base_url: str | None,
+        token: str | None,
+    ) -> tuple[AiperEncryption, str, dict, str | None]:
+        """Build the wire-critical parts of an encrypted REST call.
+
+        SINGLE source of truth for what goes on the wire — headers (including
+        the RSA ``encryptKey`` and current ``token``), URL, and the AES-CBC
+        encrypted body — shared verbatim by both the synchronous
+        (:meth:`_call_encrypted`) and asynchronous
+        (:meth:`_async_call_encrypted`) senders so the two paths can never
+        drift. The reverse-engineered envelope lives entirely here + in
+        :mod:`.crypto`.
+        """
+        enc = AiperEncryption()
+        headers = dict(self._session.headers)
+        headers["encryptKey"] = enc.encrypt_key_header
+        headers["token"] = token or (self._token or "")
+
+        url_base = (base_url or self.base_url).rstrip("/")
+        url = f"{url_base}{path}"
+
+        data = enc.encrypt_request(body) if body is not None else None
+        return enc, url, headers, data
+
+    @staticmethod
+    def _decode_encrypted_response(enc: AiperEncryption, path: str, text: str) -> dict:
+        """Decrypt + JSON-parse a REST response. Shared by both senders."""
+        decrypted = enc.decrypt_response(text)
+        try:
+            return json.loads(decrypted)
+        except Exception as err:
+            raise Exception(
+                f"Failed to parse decrypted response from {path}: {decrypted[:200]}"
+            ) from err
+
     def _call_encrypted(
         self,
         method: str,
@@ -332,33 +294,135 @@ class IrrisenseApi:
         timeout: int = 30,
         retry_login: bool = True,
     ) -> dict:
-        """Call an Aiper REST endpoint using the AES/RSA envelope."""
-        enc = AiperEncryption()
-        headers = dict(self._session.headers)
-        headers["encryptKey"] = enc.encrypt_key_header
-        headers["token"] = token or (self._token or "")
-
-        url_base = (base_url or self.base_url).rstrip("/")
-        url = f"{url_base}{path}"
-
-        data = None
-        if body is not None:
-            data = enc.encrypt_request(body)
+        """Synchronous encrypted REST call (auth / AWS-credential chain)."""
+        enc, url, headers, data = self._build_encrypted_request(
+            path, body, base_url=base_url, token=token
+        )
 
         resp = self._request_with_backoff(method, url, headers=headers, data=data, timeout=timeout)
-        decrypted = enc.decrypt_response(resp.text)
-
-        try:
-            payload = json.loads(decrypted)
-        except Exception as err:
-            raise Exception(
-                f"Failed to parse decrypted response from {path}: {decrypted[:200]}"
-            ) from err
+        payload = self._decode_encrypted_response(enc, path, resp.text)
 
         if retry_login and str(payload.get("code")) in ("401", "403"):
             _LOGGER.info("Token expired; refreshing")
             if self.refresh_token() or self.login():
                 return self._call_encrypted(
+                    method, path, body,
+                    base_url=base_url, token=self._token,
+                    timeout=timeout, retry_login=False,
+                )
+
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # Async device-data REST (aiohttp)
+    # ------------------------------------------------------------------ #
+
+    def attach_async_session(self, session: aiohttp.ClientSession) -> None:
+        """Attach the aiohttp session used for async device-data calls.
+
+        The coordinator passes Home Assistant's shared session here so we don't
+        create (and leak) our own.
+        """
+        self._async_session = session
+        self._owns_async_session = False
+
+    def _get_async_session(self) -> aiohttp.ClientSession:
+        if self._async_session is None:
+            # Fallback for non-HA callers / tests: self-owned session, closed
+            # in disconnect().
+            self._async_session = aiohttp.ClientSession()
+            self._owns_async_session = True
+        return self._async_session
+
+    async def _async_rest_wait(self) -> None:
+        """Async twin of :meth:`_rest_wait` — same ``_rest_min_interval``
+        spacing, sharing the ``_rest_next_allowed`` window with the sync path.
+        """
+        async with self._async_rest_lock:
+            now = time.time()
+            if now < self._rest_next_allowed:
+                await asyncio.sleep(self._rest_next_allowed - now)
+            self._rest_next_allowed = time.time() + self._rest_min_interval
+
+    async def _async_request_with_backoff(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        data: Any = None,
+        timeout: int = 30,
+    ) -> str:
+        """Async twin of :meth:`_request_with_backoff`. Returns the response
+        text. Same retry policy (4 attempts, exp backoff, transient-only)."""
+        max_attempts = 4
+        delay = 1.0
+        last_exc: Exception | None = None
+        session = self._get_async_session()
+        for attempt in range(1, max_attempts + 1):
+            await self._async_rest_wait()
+            try:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    data=data,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status in (429, 500, 502, 503, 504):
+                        raise Exception(f"HTTP {resp.status}")
+                    resp.raise_for_status()
+                    return await resp.text()
+            except Exception as err:
+                last_exc = err
+                msg = str(err).lower()
+                transient = any(
+                    k in msg
+                    for k in (
+                        "429", "500", "502", "503", "504",
+                        "timeout", "tempor", "connection", "reset", "refused",
+                    )
+                )
+                if attempt >= max_attempts or not transient:
+                    break
+                await asyncio.sleep(delay + random.uniform(0, 0.3))
+                delay = min(delay * 2.0, 8.0)
+        raise last_exc if last_exc else Exception("Request failed")
+
+    async def _async_call_encrypted(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        base_url: str | None = None,
+        token: str | None = None,
+        timeout: int = 30,
+        retry_login: bool = True,
+    ) -> dict:
+        """Asynchronous encrypted REST call (device-data endpoints).
+
+        Uses the SAME wire builder + response decoder as the sync path. Token
+        refresh on 401/403 hops to the executor because the auth chain
+        (refresh_token / login) is synchronous.
+        """
+        enc, url, headers, data = self._build_encrypted_request(
+            path, body, base_url=base_url, token=token
+        )
+
+        text = await self._async_request_with_backoff(
+            method, url, headers=headers, data=data, timeout=timeout
+        )
+        payload = self._decode_encrypted_response(enc, path, text)
+
+        if retry_login and str(payload.get("code")) in ("401", "403"):
+            _LOGGER.info("Token expired; refreshing (async path)")
+            loop = asyncio.get_running_loop()
+            refreshed = await loop.run_in_executor(
+                None, lambda: self.refresh_token() or self.login()
+            )
+            if refreshed:
+                return await self._async_call_encrypted(
                     method, path, body,
                     base_url=base_url, token=self._token,
                     timeout=timeout, retry_login=False,
@@ -471,10 +535,10 @@ class IrrisenseApi:
     # Device discovery / shared endpoints
     # ------------------------------------------------------------------ #
 
-    def get_devices(self) -> list[dict]:
+    async def get_devices(self) -> list[dict]:
         """List all devices on the account and filter for Irrisense units."""
         try:
-            payload = self._call_encrypted("POST", "/equipment/getEquipment", {})
+            payload = await self._async_call_encrypted("POST", "/equipment/getEquipment", {})
             if not self._is_success(payload):
                 _LOGGER.warning("get_devices failed: %s", payload.get("code"))
                 return []
@@ -529,10 +593,10 @@ class IrrisenseApi:
     # Irrisense-specific REST endpoints (all under /wr/)
     # ------------------------------------------------------------------ #
 
-    def _wr(self, path: str, body: dict | None = None) -> dict | None:
+    async def _wr(self, path: str, body: dict | None = None) -> dict | None:
         """Helper: POST to a /wr/... endpoint and return data payload on success."""
         try:
-            payload = self._call_encrypted("POST", path, body or {})
+            payload = await self._async_call_encrypted("POST", path, body or {})
             if self._is_success(payload):
                 return payload.get("data") if isinstance(payload, dict) else None
             _LOGGER.debug(
@@ -548,30 +612,30 @@ class IrrisenseApi:
         return None
 
     # -- Reads --
-    def get_wr_equipment_info(self, sn: str) -> dict | None:
+    async def get_wr_equipment_info(self, sn: str) -> dict | None:
         """Irrisense-specific status (firmware, battery, active zone, etc.)."""
-        return self._wr("/wr/getEquipmentInfo", {"sn": sn})
+        return await self._wr("/wr/getEquipmentInfo", {"sn": sn})
 
-    def get_map_list(self, sn: str) -> dict | None:
+    async def get_map_list(self, sn: str) -> dict | None:
         """Returns the S3 URL for the zone map JSON."""
-        return self._wr("/wr/getMapList", {"sn": sn})
+        return await self._wr("/wr/getMapList", {"sn": sn})
 
-    def get_watering_task_list(self, sn: str) -> dict | None:
-        return self._wr("/wr/getWateringTaskListV2", {"sn": sn})
+    async def get_watering_task_list(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getWateringTaskListV2", {"sn": sn})
 
-    def get_watering_setting(self, sn: str) -> dict | None:
-        return self._wr("/wr/getWateringSettingV2", {"sn": sn})
+    async def get_watering_setting(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getWateringSettingV2", {"sn": sn})
 
-    def get_nozzle_type_setting(self, sn: str) -> dict | None:
-        return self._wr("/wr/getNozzleTypeSetting", {"sn": sn})
+    async def get_nozzle_type_setting(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getNozzleTypeSetting", {"sn": sn})
 
-    def get_reminder_setting(self, sn: str) -> dict | None:
-        return self._wr("/wr/getReminderSetting", {"sn": sn})
+    async def get_reminder_setting(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getReminderSetting", {"sn": sn})
 
-    def get_watering_statistics(self, sn: str) -> dict | None:
-        return self._wr("/wr/wateringRecordStatisticsV2", {"sn": sn})
+    async def get_watering_statistics(self, sn: str) -> dict | None:
+        return await self._wr("/wr/wateringRecordStatisticsV2", {"sn": sn})
 
-    def get_watering_history(self, sn: str, page: int = 1, size: int = 20) -> dict | None:
+    async def get_watering_history(self, sn: str, page: int = 1, size: int = 20) -> dict | None:
         # Backend returns code=6002 when required fields are missing. Try a
         # couple of known body shapes; the mobile app sends date windows.
         now_ms = int(time.time() * 1000)
@@ -595,7 +659,7 @@ class IrrisenseApi:
             order = [cached] + [i for i in order if i != cached]
 
         for i in order:
-            result = self._wr("/wr/getWateringRecordHistoryDataV2", bodies[i])
+            result = await self._wr("/wr/getWateringRecordHistoryDataV2", bodies[i])
             if result is not None:
                 self._history_body_idx[sn] = i
                 return result
@@ -604,14 +668,14 @@ class IrrisenseApi:
         self._history_body_idx.pop(sn, None)
         return None
 
-    def get_drainage_reminder(self, sn: str) -> dict | None:
-        return self._wr("/wr/getDrainageReminderPopup", {"sn": sn})
+    async def get_drainage_reminder(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getDrainageReminderPopup", {"sn": sn})
 
-    def get_map_pesticide_usage(self, sn: str) -> dict | None:
-        return self._wr("/wr/getMapPesticideUsage", {"sn": sn})
+    async def get_map_pesticide_usage(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getMapPesticideUsage", {"sn": sn})
 
-    def get_skip_history(self, sn: str) -> dict | None:
-        return self._wr("/wr/getWateringTaskSkipRecordHistoryDataV2", {"sn": sn})
+    async def get_skip_history(self, sn: str) -> dict | None:
+        return await self._wr("/wr/getWateringTaskSkipRecordHistoryDataV2", {"sn": sn})
 
     @staticmethod
     def _parse_regions(zmap: dict | None) -> list[dict[str, Any]]:
@@ -656,7 +720,14 @@ class IrrisenseApi:
         Left in place for diagnostics / non-HA callers. Returns the raw JSON
         dict on success.
         """
-        info = self.get_map_list(sn)
+        # Sync path: the async get_map_list can't be awaited here, so issue the
+        # encrypted getMapList directly via the synchronous sender.
+        try:
+            payload = self._call_encrypted("POST", "/wr/getMapList", {"sn": sn})
+            info = payload.get("data") if self._is_success(payload) else None
+        except Exception as err:  # noqa: BLE001 - diagnostic helper
+            _LOGGER.warning("getMapList (sync) failed for %s: %s", sn, err)
+            info = None
         if info is None:
             return None
 
@@ -691,11 +762,10 @@ class IrrisenseApi:
         body is returned. aiohttp does not invoke that parser, so the plain
         JSON body comes through intact.
 
-        ``get_map_list`` is a sync encrypted REST call; we still run it on
-        the executor. The S3 GET is pure aiohttp.
+        ``get_map_list`` is now an async encrypted REST call (awaited
+        directly); the S3 GET uses the passed-in aiohttp session.
         """
-        loop = loop or asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, self.get_map_list, sn)
+        info = await self.get_map_list(sn)
         if info is None:
             return None
 
@@ -726,15 +796,15 @@ class IrrisenseApi:
             return None
 
     # -- Writes --
-    def set_schedule_enabled(self, sn: str, task_ids: list[int], enabled: bool) -> bool:
+    async def set_schedule_enabled(self, sn: str, task_ids: list[int], enabled: bool) -> bool:
         body = {"sn": sn, "taskIds": task_ids, "enabled": 1 if enabled else 0}
-        return self._wr("/wr/batchUpdateWrWateringTaskEnabledV2", body) is not None
+        return await self._wr("/wr/batchUpdateWrWateringTaskEnabledV2", body) is not None
 
-    def set_watering_setting(self, sn: str, settings: dict[str, Any]) -> bool:
+    async def set_watering_setting(self, sn: str, settings: dict[str, Any]) -> bool:
         body = {"sn": sn, **settings}
-        return self._wr("/wr/updateWateringSetting", body) is not None
+        return await self._wr("/wr/updateWateringSetting", body) is not None
 
-    def set_nozzle_type(self, sn: str, nozzle_type: int) -> bool:
+    async def set_nozzle_type(self, sn: str, nozzle_type: int) -> bool:
         # The `/wr/updateNozzleTypeSetting` REST endpoint uses a 1-indexed
         # mapping: 1 = Standard, 2 = Jet. Our device-side representation
         # (matches the iOS UI + MQTT shadow) is 0 = Standard, 1 = Jet — see
@@ -742,21 +812,21 @@ class IrrisenseApi:
         #     updateNozzleTypeSetting(sn, value == 1 ? 2 : 1)
         server_value = 2 if int(nozzle_type) == 1 else 1
         body = {"sn": sn, "nozzleType": server_value}
-        return self._wr("/wr/updateNozzleTypeSetting", body) is not None
+        return await self._wr("/wr/updateNozzleTypeSetting", body) is not None
 
-    def set_water_shortage_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_water_shortage_reminder(self, sn: str, enabled: bool) -> bool:
         body = {"sn": sn, "waterShortageReminder": 1 if enabled else 0}
-        return self._wr("/wr/updateWaterShortageReminderSetting", body) is not None
+        return await self._wr("/wr/updateWaterShortageReminderSetting", body) is not None
 
-    def set_task_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_task_reminder(self, sn: str, enabled: bool) -> bool:
         body = {"sn": sn, "taskReminder": 1 if enabled else 0}
-        return self._wr("/wr/updateTaskReminderSetting", body) is not None
+        return await self._wr("/wr/updateTaskReminderSetting", body) is not None
 
-    def set_pesticide_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_pesticide_reminder(self, sn: str, enabled: bool) -> bool:
         body = {"sn": sn, "pesticideReminder": 1 if enabled else 0}
-        return self._wr("/wr/updatePesticideReminderSetting", body) is not None
+        return await self._wr("/wr/updatePesticideReminderSetting", body) is not None
 
-    def set_drainage_reminder(self, sn: str, enabled: bool) -> bool:
+    async def set_drainage_reminder(self, sn: str, enabled: bool) -> bool:
         """Drainage reminder lives under `updateTaskReminderSetting` in the
         mobile app (shared endpoint toggles all four), but we also try a
         dedicated endpoint first in case the backend exposes one.
@@ -765,34 +835,42 @@ class IrrisenseApi:
         # No known dedicated endpoint yet — send as a field update on the
         # generic reminder setter if it exists; otherwise fall back to the
         # watering-setting path (some backends accept reminder keys there).
-        result = self._wr("/wr/updateDrainageReminderSetting", body)
+        result = await self._wr("/wr/updateDrainageReminderSetting", body)
         if result is None:
-            result = self._wr("/wr/updateTaskReminderSetting", body)
+            result = await self._wr("/wr/updateTaskReminderSetting", body)
         return result is not None
 
     # ------------------------------------------------------------------ #
     # MQTT — AWS IoT WebSocket (SigV4)
     # ------------------------------------------------------------------ #
 
+    def _aws_iot_region(self) -> str:
+        region = self._aws_region
+        if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
+            region = self._iot_endpoint.split(".iot.", 1)[1].split(".", 1)[0]
+        return region or "eu-central-1"
+
+    def _build_ws_path(self, creds: dict[str, Any]) -> str:
+        """Return the SigV4-signed WebSocket request path (``/mqtt?...``)."""
+        from .aws_sigv4 import presign_iot_wss_url  # noqa: WPS433
+
+        url = presign_iot_wss_url(
+            self._iot_endpoint,
+            self._aws_iot_region(),
+            creds["AccessKeyId"],
+            creds["SecretKey"],
+            creds.get("SessionToken"),
+        )
+        # paho's ws_set_options wants everything after the host: "/mqtt?...".
+        return url.split(self._iot_endpoint, 1)[1]
+
     def connect_mqtt(self) -> bool:
         if not self._identity_id or not self._iot_endpoint:
             _LOGGER.error("No IoT identity/endpoint available")
             return False
         try:
-            from AWSIoTPythonSDK.MQTTLib import AWSIoTMQTTClient  # noqa: WPS433
+            import paho.mqtt.client as mqtt  # noqa: WPS433
             import certifi  # noqa: WPS433
-
-            # Surface the SDK's internal logger so PUBACK / CONNACK /
-            # SUBACK show up in HA logs. If our publishes aren't getting PUBACK
-            # from the broker, we know it's an AWS IoT policy issue rather than
-            # the device ignoring a delivered frame.
-            if self.mqtt_debug:
-                try:
-                    awsiot_log = logging.getLogger("AWSIoTPythonSDK.core")
-                    if awsiot_log.level == logging.NOTSET or awsiot_log.level > logging.INFO:
-                        awsiot_log.setLevel(logging.INFO)
-                except Exception:  # noqa: BLE001 - diagnostic only
-                    pass
 
             creds = self._get_aws_credentials()
             if not creds:
@@ -801,64 +879,46 @@ class IrrisenseApi:
 
             # ClientId must equal the Cognito identity_id verbatim (exact-match
             # AWS IoT policy). Co-existence with the iOS Aiper app is
-            # impossible; last CONNECT wins — any time the phone app opens,
-            # our session is evicted, the paho loop thread dies with an
-            # AttributeError on socket teardown (see the crash shield), and
-            # we auto-recover via the thread-excepthook handler below.
+            # impossible; last CONNECT wins — whenever the phone app opens, the
+            # broker evicts us. paho 2.x reports this cleanly via on_disconnect
+            # (no thread crash), and our reconnect supervisor re-signs + retries.
             client_id = self._identity_id
             _LOGGER.info("Irrisense MQTT client_id=%s", client_id)
-            self._mqtt_client = AWSIoTMQTTClient(client_id, useWebsocket=True)
-            self._mqtt_client.configureEndpoint(self._iot_endpoint, 443)
-            self._mqtt_client.configureCredentials(certifi.where())
-            self._mqtt_client.configureIAMCredentials(
-                creds["AccessKeyId"],
-                creds["SecretKey"],
-                creds.get("SessionToken", ""),
+
+            self._intentional_disconnect = False
+            client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                client_id=client_id,
+                transport="websockets",
             )
+            # We drive reconnection ourselves so each attempt gets a freshly
+            # re-signed SigV4 URL (paho would blindly reuse the stale one).
+            client.reconnect_on_failure = False
+            client.on_connect = self._on_connect
+            client.on_disconnect = self._on_disconnect
+            if self.mqtt_debug:
+                try:
+                    client.enable_logger(logging.getLogger("paho.mqtt.aiper"))
+                except Exception:  # noqa: BLE001 - diagnostic only
+                    pass
 
-            if hasattr(self._mqtt_client, "configureAWSRegion"):
-                region = self._aws_region
-                if not region and self._iot_endpoint and ".iot." in self._iot_endpoint:
-                    region = self._iot_endpoint.split(".iot.", 1)[1].split(".", 1)[0]
-                if region:
-                    try:
-                        self._mqtt_client.configureAWSRegion(region)
-                    except Exception:
-                        pass
+            client.ws_set_options(path=self._build_ws_path(creds))
+            client.tls_set(ca_certs=certifi.where())
 
-            self._mqtt_client.configureAutoReconnectBackoffTime(1, 8, 5)
-            self._mqtt_client.configureOfflinePublishQueueing(-1)
-            self._mqtt_client.configureDrainingFrequency(2)
-            self._mqtt_client.configureConnectDisconnectTimeout(30)
-            self._mqtt_client.configureMQTTOperationTimeout(10)
+            self._mqtt_client = client
+            client.connect(self._iot_endpoint, 443, keepalive=60)
+            client.loop_start()
 
-            # SDK-level online/offline visibility. These fire for both
-            # graceful reconnects (socket drop + rebind) and for the
-            # duplicate-clientId eviction path. We log at INFO so the
-            # ping-pong is obvious in shipping logs.
-            try:
-                self._mqtt_client.onOnline = self._on_mqtt_online
-                self._mqtt_client.onOffline = self._on_mqtt_offline
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Could not attach on/offline callbacks: %s", err)
-
-            # Crash shield for paho thread death. The SDK's paho loop lives
-            # in a daemon thread; if the socket is torn down unexpectedly
-            # (duplicate-clientId eviction), paho raises
-            # `AttributeError: 'NoneType' object has no attribute 'pending'`
-            # which bubbles out of the thread with no handler — thread dies,
-            # SDK's own auto-reconnect machinery dies with it, and we end up
-            # silently zombied. Install a threading.excepthook that detects
-            # this and triggers a clean recreate.
-            self._install_thread_excepthook()
-
-            if self._mqtt_client.connect():
-                self._mqtt_connected = True
-                _LOGGER.info("Connected to AWS IoT MQTT (Irrisense)")
-                return True
+            # Wait briefly for CONNACK (on_connect flips _mqtt_connected).
+            for _ in range(100):
+                if self._mqtt_connected:
+                    _LOGGER.info("Connected to AWS IoT MQTT (Irrisense)")
+                    return True
+                time.sleep(0.1)
+            _LOGGER.warning("MQTT connect timed out waiting for CONNACK")
             return False
         except ImportError:
-            _LOGGER.error("AWSIoTPythonSDK not installed")
+            _LOGGER.error("paho-mqtt not installed")
             return False
         except Exception as err:
             _LOGGER.exception("MQTT connection failed: %r", err)
@@ -868,167 +928,105 @@ class IrrisenseApi:
         return bool(self._mqtt_connected and self._mqtt_client)
 
     # ------------------------------------------------------------------ #
-    # Crash shield + online/offline visibility
+    # paho callbacks + reconnect supervisor
     # ------------------------------------------------------------------ #
 
-    def _on_mqtt_online(self) -> None:
-        """SDK callback: fires on initial connect AND after any reconnect."""
+    @staticmethod
+    def _rc_is_success(reason_code: Any) -> bool:
+        """True if a paho reason code / int indicates success."""
+        if reason_code is None:
+            return True
+        if isinstance(reason_code, int):
+            return reason_code == 0
+        # paho 2.x ReasonCode object
+        is_failure = getattr(reason_code, "is_failure", None)
+        if is_failure is not None:
+            return not is_failure
+        return int(getattr(reason_code, "value", 1)) == 0
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        """Fires on initial connect AND after every reconnect."""
+        if not self._rc_is_success(reason_code):
+            _LOGGER.warning("Irrisense MQTT connect refused: %s", reason_code)
+            return
+        self._mqtt_connected = True
         _LOGGER.info(
-            "Irrisense MQTT ONLINE (re)established. Replaying %d subscription(s).",
+            "Irrisense MQTT ONLINE. Replaying %d subscription(s).",
             len(self._subscribed),
         )
-        self._mqtt_connected = True
-        # SDK preserves subs across its own reconnects, but a full recreate
-        # via our crash-shield path needs them replayed explicitly.
+        # Replay every remembered subscription — paho does not restore them
+        # across a fresh connect.
         for sn, cb in list(self._subscribed.items()):
             try:
                 self.subscribe_device(sn, cb)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("Failed to replay subscription for %s: %s", sn, err)
 
-    def _on_mqtt_offline(self) -> None:
-        """SDK callback: fires when the socket drops (before any reconnect attempt)."""
-        _LOGGER.warning(
-            "Irrisense MQTT OFFLINE — socket dropped. "
-            "Most common cause: the Aiper phone app just connected with the "
-            "same Cognito identityId and AWS IoT evicted us. The SDK will "
-            "attempt auto-reconnect; if the paho loop crashed, the "
-            "thread-excepthook shield will recreate the client."
-        )
-        self._mqtt_connected = False
-
-    def _install_thread_excepthook(self) -> None:
-        """Legacy shim — kept so existing call sites in connect_mqtt keep
-        working. The real work is done once per process by
-        `_ensure_global_excepthook_installed()` in `__init__`. This method
-        now just guarantees the global hook is in place (in case some
-        downstream code swapped it out at runtime).
+    def _on_disconnect(self, client, userdata, *args) -> None:
+        """Fires when the socket drops. paho 2.x passes
+        ``(client, userdata, disconnect_flags, reason_code, properties)``;
+        accept ``*args`` so minor signature differences don't break us.
         """
-        if self._thread_excepthook_installed:
+        self._mqtt_connected = False
+        reason_code = None
+        for a in args:
+            # reason_code is the arg that looks like an int / ReasonCode.
+            if isinstance(a, int) or hasattr(a, "is_failure"):
+                reason_code = a
+        if self._intentional_disconnect:
+            _LOGGER.debug("Irrisense MQTT disconnected (intentional).")
             return
-        self._thread_excepthook_installed = True
-        _ensure_global_excepthook_installed()
+        _LOGGER.warning(
+            "Irrisense MQTT OFFLINE (rc=%s). Most common cause: the Aiper phone "
+            "app connected with the same Cognito identityId and AWS IoT evicted "
+            "us. Scheduling reconnect.",
+            reason_code,
+        )
+        self._schedule_reconnect()
 
-    def _handle_paho_thread_death(self, exc: BaseException | None) -> None:
-        """Single entry point called by the module-level excepthook.
-
-        Runs in the dying thread's context. Responsibilities:
-
-        1. If we just tore the old client down ourselves (recovery in
-           progress), consume one expected-death and return — do NOT spawn
-           another worker.
-        2. If we're already reconnecting for any other reason, skip.
-        3. If our client is already None, there's nothing to recover.
-        4. Otherwise spawn the crash-shield recovery worker.
+    def _schedule_reconnect(self) -> None:
+        """Start the reconnect supervisor (one at a time). Each attempt
+        re-signs a fresh SigV4 URL — temporary credentials rotate, so the
+        previous URL cannot simply be reused.
         """
         with self._lock:
-            if self._expected_paho_deaths > 0:
-                self._expected_paho_deaths -= 1
-                _LOGGER.debug(
-                    "Expected paho thread death absorbed (crash-shield "
-                    "recovery). Remaining pending: %d",
-                    self._expected_paho_deaths,
-                )
-                return
             if self._reconnecting:
-                _LOGGER.debug(
-                    "Paho thread died while already reconnecting — ignoring "
-                    "duplicate crash."
-                )
-                return
-            if self._mqtt_client is None:
-                _LOGGER.debug(
-                    "Paho thread died but _mqtt_client is already None; "
-                    "nothing to recover."
-                )
                 return
             self._reconnecting = True
 
-        _LOGGER.warning(
-            "MQTT paho loop thread died (%s: %s) — triggering crash-shield "
-            "reconnect.",
-            type(exc).__name__ if exc else "?",
-            exc,
-        )
-        self._mqtt_connected = False
-        self._spawn_crash_shield_worker()
-
-    # Kept under the old name for any external callers (e.g. tests) that may
-    # still reference it.
-    def _handle_mqtt_thread_death(self) -> None:  # pragma: no cover
-        self._handle_paho_thread_death(None)
-
-    def _spawn_crash_shield_worker(self) -> None:
-        """Spawn the daemon thread that recreates the MQTT client."""
-
         def _worker() -> None:
+            delay = 1.0
             try:
-                # Short backoff — enough for the evicting peer's CONNECT
-                # to settle so we don't immediately trip again.
-                time.sleep(5.0)
-                # Drop the old client reference; its internals are now
-                # in an inconsistent state (dead thread, possibly stale
-                # sockets). A fresh AWSIoTMQTTClient is cheap.
-                old = None
-                try:
-                    old = self._mqtt_client
-                    self._mqtt_client = None
-                except Exception:  # noqa: BLE001
-                    pass
-
-                if old is not None:
-                    # Our own disconnect will cause the old paho thread's
-                    # `socket().pending()` to raise AttributeError as it
-                    # unwinds. Pre-register ONE expected death so the
-                    # excepthook swallows it instead of spawning _worker_B.
-                    with self._lock:
-                        self._expected_paho_deaths += 1
-                    # Trim the disconnect timeout on the old client — it's
-                    # already dead, waiting 30 s just blocks us from
-                    # recreating. 5 s is plenty for a best-effort tear-down.
+                while not self._intentional_disconnect and not self._mqtt_connected:
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, 8.0)
+                    if self._mqtt_client is None:
+                        return
                     try:
-                        if hasattr(old, "configureConnectDisconnectTimeout"):
-                            old.configureConnectDisconnectTimeout(5)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    try:
-                        old.disconnect()
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                _LOGGER.info("Crash-shield: recreating MQTT client...")
-                ok = self.connect_mqtt()
-                if not ok:
-                    _LOGGER.warning(
-                        "Crash-shield: reconnect attempt failed; will retry "
-                        "on next publish or scheduled poll."
-                    )
-                    return
-                # connect_mqtt() sets _mqtt_connected via onOnline which also
-                # replays subscriptions; nothing more to do here.
+                        creds = self._get_aws_credentials()
+                        if not creds:
+                            _LOGGER.debug("Reconnect: no AWS credentials yet")
+                            continue
+                        self._mqtt_client.ws_set_options(
+                            path=self._build_ws_path(creds)
+                        )
+                        self._mqtt_client.reconnect()
+                        # Give CONNACK a moment; _on_connect flips the flag.
+                        for _ in range(50):
+                            if self._mqtt_connected or self._intentional_disconnect:
+                                break
+                            time.sleep(0.1)
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug("MQTT reconnect attempt failed: %s", err)
+                if self._mqtt_connected:
+                    _LOGGER.info("Irrisense MQTT reconnected.")
             finally:
-                # Give the old paho thread a moment to finish dying so any
-                # straggler AttributeError gets absorbed by the expected-
-                # death counter instead of bleeding past the finally block.
-                time.sleep(0.5)
                 with self._lock:
                     self._reconnecting = False
-                    # If we counted a death that never arrived (paho exited
-                    # cleanly), don't carry the debt into the next cycle.
-                    if self._expected_paho_deaths > 0:
-                        _LOGGER.debug(
-                            "Clearing %d unused expected-death credit(s) at "
-                            "end of recovery cycle.",
-                            self._expected_paho_deaths,
-                        )
-                        self._expected_paho_deaths = 0
 
-        t = threading.Thread(
-            target=_worker,
-            name="irrisense-mqtt-recover",
-            daemon=True,
-        )
-        t.start()
+        threading.Thread(
+            target=_worker, name="irrisense-mqtt-reconnect", daemon=True
+        ).start()
 
     def request_shadow(self, sn: str) -> bool:
         if not self.is_mqtt_connected():
@@ -1151,7 +1149,10 @@ class IrrisenseApi:
                 TOPIC_SHADOW_UPDATE_DOCUMENTS.format(sn=sn),
             ]
             for t in topics:
-                self._mqtt_client.subscribe(t, 1, on_message)
+                # paho routes messages to a per-topic callback registered via
+                # message_callback_add; subscribe() only installs the filter.
+                self._mqtt_client.message_callback_add(t, on_message)
+                self._mqtt_client.subscribe(t, 1)
                 _LOGGER.debug("Subscribed to %s", t)
             return True
         except Exception as err:
@@ -1360,9 +1361,16 @@ class IrrisenseApi:
     # ------------------------------------------------------------------ #
 
     def disconnect(self) -> None:
-        if self._mqtt_client and self._mqtt_connected:
+        # Signal the on_disconnect handler + reconnect supervisor to stand down.
+        self._intentional_disconnect = True
+        if self._mqtt_client:
             try:
                 self._mqtt_client.disconnect()
+            except Exception:
+                pass
+            try:
+                # Stop paho's network loop thread started by loop_start().
+                self._mqtt_client.loop_stop()
             except Exception:
                 pass
             self._mqtt_connected = False
@@ -1370,4 +1378,15 @@ class IrrisenseApi:
             self._session.close()
         except Exception:
             pass
+        # Only close a self-owned aiohttp session; Home Assistant's shared
+        # session (attached via attach_async_session) must never be closed here.
+        if self._owns_async_session and self._async_session is not None:
+            session, self._async_session = self._async_session, None
+            self._owns_async_session = False
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and not session.closed:
+                loop.create_task(session.close())
         _LOGGER.info("Irrisense API disconnected")
