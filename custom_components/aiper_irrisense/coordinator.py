@@ -241,7 +241,7 @@ class IrrisenseCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         try:
             # Refresh device list on every pass (cheap; once a day would be
             # enough, but it also catches new devices being added).
-            await self.hass.async_add_executor_job(self.api.get_devices)
+            await self.api.get_devices()
 
             device_registry = dr.async_get(self.hass)
             for dev in self.devices:
@@ -266,19 +266,13 @@ class IrrisenseCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         slot["equipment"] = dev
 
         # Always fetch the WR status (light call, per-poll)
-        slot["wr_info"] = await self.hass.async_add_executor_job(
-            self.api.get_wr_equipment_info, sn
-        )
+        slot["wr_info"] = await self.api.get_wr_equipment_info(sn)
 
         # Watering setting + task list: every 30 min
         now = time.time()
         if now - self._last_settings_fetch.get(sn, 0) > _SETTINGS_REFRESH_SECONDS:
-            slot["setting"] = await self.hass.async_add_executor_job(
-                self.api.get_watering_setting, sn
-            )
-            slot["tasks"] = await self.hass.async_add_executor_job(
-                self.api.get_watering_task_list, sn
-            )
+            slot["setting"] = await self.api.get_watering_setting(sn)
+            slot["tasks"] = await self.api.get_watering_task_list(sn)
             self._last_settings_fetch[sn] = now
 
         # Zone map (S3 JSON): every `map_refresh_hours`. Uses aiohttp to
@@ -299,22 +293,14 @@ class IrrisenseCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         # History + stats: every `history_refresh_hours`
         if now - self._last_history_fetch.get(sn, 0) > self._history_refresh:
-            slot["stats"] = await self.hass.async_add_executor_job(
-                self.api.get_watering_statistics, sn
-            )
-            slot["history"] = await self.hass.async_add_executor_job(
-                self.api.get_watering_history, sn
-            )
+            slot["stats"] = await self.api.get_watering_statistics(sn)
+            slot["history"] = await self.api.get_watering_history(sn)
             self._last_history_fetch[sn] = now
 
         # Nozzle + reminder: every `reminder_refresh_hours`
         if now - self._last_reminder_fetch.get(sn, 0) > self._reminder_refresh:
-            slot["nozzle"] = await self.hass.async_add_executor_job(
-                self.api.get_nozzle_type_setting, sn
-            )
-            slot["reminder"] = await self.hass.async_add_executor_job(
-                self.api.get_reminder_setting, sn
-            )
+            slot["nozzle"] = await self.api.get_nozzle_type_setting(sn)
+            slot["reminder"] = await self.api.get_reminder_setting(sn)
             self._last_reminder_fetch[sn] = now
 
     # ------------------------------------------------------------------ #
@@ -652,9 +638,7 @@ class IrrisenseCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     async def async_set_schedule_enabled(
         self, sn: str, task_ids: list[int], enabled: bool
     ) -> bool:
-        ok = await self.hass.async_add_executor_job(
-            self.api.set_schedule_enabled, sn, task_ids, enabled
-        )
+        ok = await self.api.set_schedule_enabled(sn, task_ids, enabled)
         if ok:
             # Force a settings refresh on next poll.
             self._last_settings_fetch.pop(sn, None)
@@ -662,18 +646,14 @@ class IrrisenseCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return ok
 
     async def async_set_nozzle_type(self, sn: str, nozzle_type: int) -> bool:
-        ok = await self.hass.async_add_executor_job(
-            self.api.set_nozzle_type, sn, nozzle_type
-        )
+        ok = await self.api.set_nozzle_type(sn, nozzle_type)
         if ok:
             self._last_reminder_fetch.pop(sn, None)
             await self.async_request_refresh()
         return ok
 
     async def async_set_watering_setting(self, sn: str, settings: dict[str, Any]) -> bool:
-        ok = await self.hass.async_add_executor_job(
-            self.api.set_watering_setting, sn, settings
-        )
+        ok = await self.api.set_watering_setting(sn, settings)
         if ok:
             self._last_settings_fetch.pop(sn, None)
             await self.async_request_refresh()
@@ -695,7 +675,7 @@ class IrrisenseCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if fn is None:
             _LOGGER.warning("Unknown reminder key: %s", key)
             return False
-        ok = await self.hass.async_add_executor_job(fn, sn, enabled)
+        ok = await fn(sn, enabled)
         if ok:
             self._last_reminder_fetch.pop(sn, None)
             await self.async_request_refresh()

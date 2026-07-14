@@ -11,6 +11,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import IrrisenseApi
 from .const import (
@@ -49,12 +50,13 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         password=data[CONF_PASSWORD],
         region=data[CONF_REGION],
     )
+    api.attach_async_session(async_get_clientsession(hass))
     try:
         ok = await hass.async_add_executor_job(api.login)
         if not ok:
             raise InvalidAuth
 
-        devices = await hass.async_add_executor_job(api.get_devices)
+        devices = await api.get_devices()
     except InvalidAuth:
         raise
     except Exception as err:

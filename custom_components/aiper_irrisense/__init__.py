@@ -12,6 +12,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import IrrisenseApi
 from .const import (
@@ -92,18 +93,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         region=entry.data.get(CONF_REGION, "eu"),
     )
     api.mqtt_debug = bool(entry.options.get(CONF_MQTT_DEBUG, False))
+    # Device-data REST calls use aiohttp via Home Assistant's shared session.
+    api.attach_async_session(async_get_clientsession(hass))
 
-    # Auth + device discovery on the executor. Wrapped in asyncio.wait_for
-    # so a slow cloud round-trip cannot push the setup coroutine past HA's
-    # 60s bootstrap window. ConfigEntryNotReady triggers HA's exponential
-    # backoff retry rather than the no-retry SETUP_ERROR path. See #11.
+    # Auth + device discovery. login is synchronous (it feeds the MQTT
+    # bootstrap threads) so it runs on the executor; get_devices is async.
+    # Wrapped in asyncio.wait_for so a slow cloud round-trip cannot push the
+    # setup coroutine past HA's 60s bootstrap window. ConfigEntryNotReady
+    # triggers HA's exponential backoff retry rather than the no-retry
+    # SETUP_ERROR path. See #11.
     try:
         await asyncio.wait_for(
             hass.async_add_executor_job(api.login), timeout=15
         )
-        devices = await asyncio.wait_for(
-            hass.async_add_executor_job(api.get_devices), timeout=15
-        )
+        devices = await asyncio.wait_for(api.get_devices(), timeout=15)
     except TimeoutError as ex:
         raise ConfigEntryNotReady(
             f"Aiper cloud timeout during setup (check network): {ex}"
