@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — Async transport rewrite, typed errors, test harness + CI
+
+> **Requires Home Assistant 2024.11 or newer.** The MQTT layer now uses
+> paho-mqtt 2.x, which ships with HA 2024.11+.
+
+### Changed
+
+- **MQTT transport rewritten** — replaced the deprecated `AWSIoTPythonSDK` with
+  **paho-mqtt 2.x over a SigV4-signed WebSocket**. The process-wide
+  `threading.excepthook` crash shield is gone: paho 2.x reports socket teardown
+  cleanly via `on_disconnect`, and a small reconnect supervisor re-signs a fresh
+  SigV4 URL on each attempt. Publish topics / payloads / QoS are unchanged.
+- **REST device-data calls migrated from `requests` to `aiohttp`** on Home
+  Assistant's shared session. The auth / AWS-credential chain stays synchronous
+  (the MQTT bootstrap threads need it that way); a single shared request builder
+  keeps the encrypted wire bytes identical across the sync and async paths.
+- **Minimum Home Assistant version raised to 2024.11** (for paho-mqtt 2.x).
+
+### Added
+
+- **Typed `InvalidAuth` / `CannotConnect` exceptions** replacing exception-message
+  string matching. The config flow now surfaces `cannot_connect` distinctly from
+  `invalid_auth`.
+- **Test harness** (`pytest-homeassistant-custom-component`) with regression
+  tests pinning the AES/RSA crypto envelope, the `const.py` dose/label presets,
+  the coordinator's MQTT frame parsing (spike filter + duration latch), the async
+  REST path, the AWS SigV4 signer, and the typed exceptions.
+- **GitHub Actions CI** — hassfest, HACS validation (advisory), and pytest on a
+  Python 3.11 + 3.13 matrix.
+- **`advanced_diagnostics` option** gating the raw `debug_publish` service
+  (off by default).
+
+### Fixed
+
+- MQTT publish logging is gated behind the existing `mqtt_debug` option instead
+  of always logging at INFO on the start/stop path.
+- `get_watering_history` caches the request body-shape the backend accepted per
+  device instead of re-brute-forcing all four shapes on every refresh.
+
 ## [0.3.0] — Bug fixes, point-zone watchdog, robust setup
 
 ### Added
