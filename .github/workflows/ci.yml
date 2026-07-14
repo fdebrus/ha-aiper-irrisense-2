@@ -22,6 +22,10 @@ jobs:
   hacs:
     name: HACS validation
     runs-on: ubuntu-latest
+    # HACS store-readiness checks (topics / description / issues-enabled) don't
+    # apply to a private fork installed as a custom repository, so keep this job
+    # advisory: it still runs and reports, but never blocks the build.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: hacs/action@main
