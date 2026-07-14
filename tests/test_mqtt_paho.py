@@ -14,9 +14,19 @@ from __future__ import annotations
 import time
 import types
 
+import paho.mqtt.client as _paho
 import pytest
 
 from custom_components.aiper_irrisense.api import IrrisenseApi
+
+# paho-mqtt 2.x introduced CallbackAPIVersion. On Python 3.11 the HA test pin
+# drags in paho 1.6.x (see requirements_test.txt), where connect_mqtt's
+# VERSION2 client can't be built — so skip just that wiring test there. Python
+# 3.12/3.13 CI runs it against real paho 2.x.
+requires_paho2 = pytest.mark.skipif(
+    not hasattr(_paho, "CallbackAPIVersion"),
+    reason="needs paho-mqtt 2.x (CallbackAPIVersion)",
+)
 
 
 def _api_with_creds() -> IrrisenseApi:
@@ -138,6 +148,7 @@ class _FakeClient:
         self.on_connect(self, None, {}, 0, None)
 
 
+@requires_paho2
 def test_connect_mqtt_builds_signed_paho_client(monkeypatch) -> None:
     import paho.mqtt.client as mqtt
 
