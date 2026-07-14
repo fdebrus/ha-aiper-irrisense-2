@@ -34,7 +34,8 @@ use them in automations and dashboards.
 
 ## Requirements
 
-- Home Assistant **2024.1** or newer
+- Home Assistant **2024.11** or newer (the integration uses paho-mqtt 2.x,
+  which ships with Home Assistant 2024.11+)
 - An Aiper account with at least one Irrisense 2 device already bound to it
   via the Aiper mobile app
 - Internet connectivity from your HA host (this is a cloud-polled integration)
