@@ -302,8 +302,11 @@ class IrrisenseApi:
         resp = self._request_with_backoff(method, url, headers=headers, data=data, timeout=timeout)
         payload = self._decode_encrypted_response(enc, path, resp.text)
 
-        if retry_login and str(payload.get("code")) in ("401", "403"):
-            _LOGGER.info("Token expired; refreshing")
+        # 402 = "account already in use on another device, please log in
+        # again" — the phone app logging in invalidates our REST token. Treat
+        # it like 401/403 and re-authenticate so HA recovers its session.
+        if retry_login and str(payload.get("code")) in ("401", "402", "403"):
+            _LOGGER.info("Token rejected (%s); re-authenticating", payload.get("code"))
             if self.refresh_token() or self.login():
                 return self._call_encrypted(
                     method, path, body,
@@ -415,8 +418,11 @@ class IrrisenseApi:
         )
         payload = self._decode_encrypted_response(enc, path, text)
 
-        if retry_login and str(payload.get("code")) in ("401", "403"):
-            _LOGGER.info("Token expired; refreshing (async path)")
+        # 402 = "account already in use on another device, please log in
+        # again" — the phone app logging in invalidates our REST token. Treat
+        # it like 401/403 and re-authenticate so HA recovers its session.
+        if retry_login and str(payload.get("code")) in ("401", "402", "403"):
+            _LOGGER.info("Token rejected (%s); re-authenticating (async path)", payload.get("code"))
             loop = asyncio.get_running_loop()
             refreshed = await loop.run_in_executor(
                 None, lambda: self.refresh_token() or self.login()
