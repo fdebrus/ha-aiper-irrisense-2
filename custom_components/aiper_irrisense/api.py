@@ -547,6 +547,37 @@ class IrrisenseApi:
             if isinstance(devices, dict):
                 devices = devices.get("list", devices.get("equipments", []))
 
+            # Diagnostic: surface how many devices the backend returned and
+            # their serial prefixes, so a "no devices found" can be told apart
+            # from a serial-prefix filter miss. Serials are truncated.
+            _LOGGER.debug(
+                "getEquipment (async) returned code=%s, %d device(s); serials=%s",
+                payload.get("code") if isinstance(payload, dict) else None,
+                len(devices) if isinstance(devices, list) else -1,
+                [str(d.get("sn"))[:6] + "…" for d in devices if isinstance(d, dict)]
+                if isinstance(devices, list) else devices,
+            )
+
+            # If the async (aiohttp) path saw zero, compare with the sync
+            # (requests) path — this pinpoints whether the aiohttp migration is
+            # at fault. Runs on the executor so it doesn't block the loop.
+            if isinstance(devices, list) and not devices:
+                try:
+                    loop = asyncio.get_running_loop()
+                    sync_payload = await loop.run_in_executor(
+                        None, self._call_encrypted, "POST", "/equipment/getEquipment", {}
+                    )
+                    sync_data = sync_payload.get("data") or [] if isinstance(sync_payload, dict) else []
+                    if isinstance(sync_data, dict):
+                        sync_data = sync_data.get("list", sync_data.get("equipments", []))
+                    _LOGGER.debug(
+                        "getEquipment (sync compare) code=%s → %s device(s)",
+                        sync_payload.get("code") if isinstance(sync_payload, dict) else None,
+                        len(sync_data) if isinstance(sync_data, list) else sync_data,
+                    )
+                except Exception as cmp_err:  # noqa: BLE001 - diagnostic only
+                    _LOGGER.debug("getEquipment sync compare failed: %s", cmp_err)
+
             out: list[dict] = []
             for device in devices:
                 sn = device.get("sn")
