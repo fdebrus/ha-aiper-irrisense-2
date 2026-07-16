@@ -19,9 +19,13 @@ API_ENDPOINTS: Final = {
     "asia": "https://apiasia.aiper.com",
 }
 
-# Irrisense serial prefixes. `WRX` is the original/online-store SKU; `WGX` is
-# the big-box-retail variant (e.g. Costco). Both speak the same wire protocol.
-IRRISENSE_SERIAL_PREFIXES: Final = ("WRX", "WGX")
+# Irrisense serial *families*. Rather than chase individual SKU prefixes
+# (WRX original/online-store, WGX big-box retail, WRZ / WCX later hardware
+# revisions, ...), match the 2-letter batch family so a new third letter is
+# covered automatically without a release. WR / WG / WC / WL are the Irrisense
+# sprinkler families; other Aiper product lines (pool cleaners, etc.) use
+# different families and are left to the sibling ha-aiper integration.
+IRRISENSE_SERIAL_PREFIXES: Final = ("WR", "WG", "WC", "WL")
 
 # Model string as written into the S3 zone-map path.
 IRRISENSE_MODEL: Final = "IrriSense_2"

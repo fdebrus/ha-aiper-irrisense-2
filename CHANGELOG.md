@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — Detect all Irrisense serial families
+
+### Fixed
+
+- **Irrisense units with a `WRZ` (and other newer) serial prefix were not
+  detected** — the config flow reported "No Irrisense devices found on this
+  account" even though login succeeded. The device-list filter only accepted
+  the exact `WRX` / `WGX` SKU prefixes. It now matches the 2-letter serial
+  *family* (`WR` / `WG` / `WC` / `WL`), so new batch letters are covered
+  automatically without needing a release. `get_devices` also logs (at debug)
+  any serial it drops, so a genuinely-new family is diagnosable instead of
+  vanishing silently.
+
 ## [0.4.0] — Async transport rewrite, typed errors, test harness + CI
 
 > **Requires Home Assistant 2024.11 or newer.** The MQTT layer now uses

@@ -548,19 +548,33 @@ class IrrisenseApi:
                 devices = devices.get("list", devices.get("equipments", []))
 
             out: list[dict] = []
+            skipped: list[str] = []
             for device in devices:
                 sn = device.get("sn")
                 if not sn:
                     continue
-                # Filter: only Irrisense serials (WRX / WGX prefix). Leave other
-                # aiper devices to the sibling ha-aiper integration.
+                # Filter: only Irrisense sprinkler serials (see
+                # IRRISENSE_SERIAL_PREFIXES). Leave other aiper devices (e.g.
+                # pool cleaners) to the sibling ha-aiper integration.
                 if not sn.upper().startswith(IRRISENSE_SERIAL_PREFIXES):
+                    skipped.append(sn)
                     continue
                 self._devices[sn] = device
                 zid = device.get("zoneId") or device.get("zone_id")
                 if isinstance(zid, str) and zid:
                     self._device_zone_id_by_sn[sn] = zid
                 out.append(device)
+            # Surface serials we dropped so a new hardware prefix (that ought to
+            # be an Irrisense) is diagnosable from the log instead of silently
+            # vanishing into "no devices found". Serials truncated.
+            if skipped:
+                _LOGGER.debug(
+                    "get_devices: %d device(s) skipped by serial-prefix filter "
+                    "(prefixes=%s): %s",
+                    len(skipped),
+                    IRRISENSE_SERIAL_PREFIXES,
+                    [str(s)[:6] + "…" for s in skipped],
+                )
             return out
         except Exception as err:
             _LOGGER.error("Failed to get devices: %s", err)
