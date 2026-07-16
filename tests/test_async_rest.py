@@ -132,3 +132,34 @@ async def test_get_watering_history_caches_working_shape() -> None:
     assert result == {"list": []}
     # The working shape index (1) is cached for next time.
     assert api._history_body_idx["S"] == 1
+
+
+async def test_async_402_triggers_reauth_and_retries() -> None:
+    """402 ('account used on another device') must re-login and retry, so HA
+    recovers its REST session after the phone app invalidates the token."""
+    api = IrrisenseApi("u", "p", "eu")
+    # First response: 402. Second (after re-auth): success.
+    api.attach_async_session(
+        _FakeSession(
+            ['{"code":"402","message":"used on another device"}',
+             '{"code":"0","data":{"ok":1}}']
+        )
+    )
+    calls = {"refresh": 0, "login": 0}
+
+    def _refresh():
+        calls["refresh"] += 1
+        return False  # force fallback to login
+
+    def _login():
+        calls["login"] += 1
+        api._token = "FRESH"
+        return True
+
+    api.refresh_token = _refresh
+    api.login = _login
+
+    out = await api._async_call_encrypted("POST", "/wr/x", {"sn": "S"})
+    assert out == {"code": "0", "data": {"ok": 1}}
+    assert calls["login"] == 1  # re-authenticated exactly once
+    assert api._token == "FRESH"
